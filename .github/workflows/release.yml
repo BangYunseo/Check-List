@@ -1,0 +1,37 @@
+name: Release Windows exe
+
+# vX.Y.Z 형식의 태그를 푸시하면 Windows에서 PyInstaller로 exe를 빌드해
+# 같은 이름의 GitHub Release에 자동으로 첨부한다. (exe는 저장소에 커밋하지 않고
+# Release 에셋으로만 보관 → 저장소 히스토리는 소스만 깔끔하게 유지)
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write        # Release 생성/업로드에 필요
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: 소스 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 파이썬 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: PyInstaller 설치
+        run: pip install pyinstaller
+
+      # --onefile: 단일 exe / --windowed: 콘솔 창 없이 GUI만
+      # tkinter는 파이썬에 포함돼 있어 별도 설정 없이 함께 묶인다.
+      - name: exe 빌드
+        run: pyinstaller --onefile --windowed --name Check-List checklist.py
+
+      - name: Release에 exe 첨부
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Check-List.exe
