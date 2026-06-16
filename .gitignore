@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller 빌드 산출물
+build/
+dist/
+*.spec
+
+# 앱 런타임 데이터 (실행 시 자동 생성되는 개인 업무 데이터)
+checklist_data.json
+*.corrupt.bak
+*.tmp
