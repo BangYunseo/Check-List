@@ -9,6 +9,7 @@ Work CheckList — 업무 체크리스트 프로그램
 - 기준 문서: checklist_spec.md
 """
 
+import copy
 import json
 import os
 import shutil
@@ -16,7 +17,7 @@ import sys
 
 try:
     import tkinter as tk
-    from tkinter import ttk, messagebox, simpledialog
+    from tkinter import ttk, messagebox
     import tkinter.font as tkfont
 except ImportError:  # tkinter 미설치 환경
     sys.stderr.write(
@@ -206,13 +207,15 @@ def _legacy_auto_texts(categories):
     return texts
 
 
-def ensure_task_fields(task):
+def ensure_task_fields(task, index=0):
     """업무 한 건의 필드를 v2 구조로 보정한다(필요 시 v1 → v2 마이그레이션)."""
     task.setdefault("title", task.pop("subtitle", ""))  # subtitle → title
     task.setdefault("kind", "")
     task.setdefault("categories", [])
     task.setdefault("status", "진행")
     task.setdefault("collapsed", False)
+    # 우선순위(1/2/3): 기존 데이터는 순서대로 1,2,3 … 4번째부터는 고정 3.
+    task.setdefault("priority", min(index + 1, 3))
 
     if "items" not in task:
         # v1: checks(자동) + manual(수동)을 실제 항목으로 변환(데이터 보존).
@@ -273,8 +276,8 @@ def load_data():
         data.setdefault("always_on_top", True)
         data.setdefault("geometry", None)
         data.setdefault("tasks", [])
-        for task in data["tasks"]:
-            ensure_task_fields(task)
+        for idx, task in enumerate(data["tasks"]):
+            ensure_task_fields(task, idx)
         data["version"] = DATA_VERSION
         return data, None
     except Exception as e:  # noqa: BLE001  (손상/파싱 실패 전부 복구 대상)
@@ -428,6 +431,13 @@ class TaskCard:
         self.title_lbl = None      # 제목 라벨
         self.prog_lbl = None       # 진행률 (n/m)
         self.item_blocks = {}      # {item_id: block Frame} — 항목 드래그 정렬용
+        # 편집 모드: 켜면 각 항목의 +세부·✕ 버튼이 보인다(평소엔 숨김 → 깔끔).
+        # 카드 객체가 들고 있어 rebuild 후에도 유지된다(전체 render 때만 초기화).
+        self.edit_mode = False
+        self._snapshot = None      # 편집 진입 시 항목 상태 사본(취소 시 복구용)
+        self._edit_new = None      # rebuild 후 인라인 입력할 대상 ("item"/"sub", id)
+        self._item_cbs = {}        # {("item"|"sub", id): Checkbutton} — 인라인 편집용
+        self._last_title_fit = None  # (폭, 제목) 캐시 — 같은 값이면 재계산 생략
 
     # ---- 생성 / 재생성 ----------------------------------------------------
     def build(self, position):
@@ -452,19 +462,26 @@ class TaskCard:
         # 높이 변화 → body <Configure> 가 scrollregion 을 알아서 갱신.
 
     @staticmethod
-    def _rank_color(position, dimmed):
+    def _rank_color(priority, dimmed):
+        # 우선순위 1 빨강 / 2 주황 / 3 노랑. 종료·제외(dimmed)면 회색.
         if dimmed:
             return "#9aa0a6"
-        return {1: "#d9342b", 2: "#e8821e", 3: "#caa200"}.get(position, "#9aa0a6")
+        return {1: "#d9342b", 2: "#e8821e", 3: "#caa200"}.get(priority, "#caa200")
+
+    def _priority(self):
+        p = self.task.get("priority", 3)
+        return p if p in (1, 2, 3) else 3
 
     def _populate(self, position):
         self.position = position
         app, task = self.app, self.task
+        self._item_cbs = {}
+        self._last_title_fit = None   # 새 제목 라벨이므로 캐시 초기화
 
         header = ttk.Frame(self.frame)
         header.pack(fill="x")
 
-        # 업무 드래그 핸들 (우선순위 정렬)
+        # 업무 드래그 핸들 (카드 순서 정렬 — 우선순위 배지와는 별개)
         handle = ttk.Label(header, text="↕", cursor="fleur", foreground="#999")
         handle.pack(side="left", padx=(0, 2))
         handle.bind("<ButtonPress-1>", lambda e: app._drag_start(task))
@@ -478,11 +495,15 @@ class TaskCard:
         dimmed = task.get("status") in STATUS_DIMMED
         # '제외'면 잠금: 상태 변경과 드래그만 허용하고 내부 편집은 전부 막는다.
         locked = task.get("status") == "제외"
-        # 위로 끌수록 높은 우선순위. 상위 3개를 색 배지로 구분.
-        self.rank_lbl = tk.Label(header, text=str(position),
-                                 bg=self._rank_color(position, dimmed), fg="white",
-                                 font=("Segoe UI", 9, "bold"), padx=6)
+        if locked:
+            self.edit_mode = False   # 잠긴 카드는 편집 모드 자체가 꺼져 있어야 한다.
+        # 우선순위 배지(1/2/3) — 우클릭으로 변경. 드래그 순서와는 독립.
+        priority = self._priority()
+        self.rank_lbl = tk.Label(header, text=str(priority),
+                                 bg=self._rank_color(priority, dimmed), fg="white",
+                                 font=("Segoe UI", 9, "bold"), padx=6, cursor="hand2")
         self.rank_lbl.pack(side="left", padx=(6, 4))
+        self.rank_lbl.bind("<Button-3>", self._show_priority_menu)
 
         # 제목 라벨은 생성만 해두고 '맨 마지막에' pack 한다. 그래야 폭이 좁아질 때
         # 고정 버튼들이 먼저 자리를 차지하고, 남는 가운데 공간만 제목이 차지한다
@@ -502,6 +523,12 @@ class TaskCard:
         ttk.Button(header, text="✎", width=3,
                    state=("disabled" if locked else "normal"),
                    command=lambda: app.edit_task(task)).pack(side="right", padx=(0, 4))
+        # 수정 토글: 켜면 각 항목의 +세부·✕ 버튼이 보인다(Toolbutton = 눌린 모양).
+        self.edit_var = tk.BooleanVar(value=self.edit_mode)
+        ttk.Checkbutton(header, text="수정", style="Toolbutton",
+                        variable=self.edit_var, takefocus=0,
+                        state=("disabled" if locked else "normal"),
+                        command=self._toggle_edit).pack(side="right", padx=(0, 4))
         status = task.get("status", "진행")
         smb = tk.Menubutton(header, text=status,
                             bg=STATUS_COLORS.get(status, "#666"),
@@ -534,13 +561,14 @@ class TaskCard:
         controls.pack(fill="x", pady=(6, 2))
         ttk.Button(controls, text="+ 항목",
                    state=("disabled" if locked else "normal"),
-                   command=lambda: app.add_item(task)).pack(side="left")
+                   command=self.begin_add_item).pack(side="left")
         self._build_preset_menu(controls, locked)
 
         items = task.setdefault("items", [])
         if not items:
             ttk.Label(self.frame, text="항목 없음 — [+ 항목] 또는 [프리셋 불러오기]",
                       foreground="#999").pack(anchor="w", padx=(4, 0), pady=(2, 0))
+            self._maybe_start_inline_edit()
             return
 
         # 카테고리(group)별로 묶어서 표시. 그룹이 2개 이상일 때만 칸 헤더를 보인다
@@ -569,6 +597,8 @@ class TaskCard:
                           font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(6, 1))
             for item in [it for it in items if it.get("group", "") == g]:
                 self._render_item_block(item, locked)
+
+        self._maybe_start_inline_edit()
 
     def _build_preset_menu(self, parent, locked=False):
         app, task = self.app, self.task
@@ -618,26 +648,171 @@ class TaskCard:
         ih.bind("<ButtonRelease-1>", app._item_drag_end)
 
         var = tk.BooleanVar(value=bool(item.get("checked")))
-        ttk.Checkbutton(row, text=item["text"], variable=var, state=st,
-                        command=lambda it=item, v=var: app.toggle_item(it, v)
-                        ).pack(side="left")
-        ttk.Button(row, text="✕", width=2, state=st,
-                   command=lambda it=item: app.delete_item(task, it)
-                   ).pack(side="right")
-        ttk.Button(row, text="+세부", width=5, state=st,
-                   command=lambda it=item: app.add_subitem(task, it)
-                   ).pack(side="right", padx=(0, 4))
+        cb = ttk.Checkbutton(row, text=item["text"], variable=var, state=st,
+                             command=lambda it=item, v=var: app.toggle_item(it, v))
+        cb.pack(side="left")
+        self._item_cbs[("item", item["id"])] = cb
+        # +세부·✕ 는 '수정' 토글이 켜졌을 때만 보인다(평소엔 만들지 않음 → 깔끔).
+        # 수정 모드 안에서는 확인창 없이 바로 처리한다(취소는 모드 종료 시 일괄 복구).
+        if self.edit_mode:
+            ttk.Button(row, text="✕", width=2, state=st,
+                       command=lambda it=item: self.remove_item(it)
+                       ).pack(side="right")
+            ttk.Button(row, text="+세부", width=5, state=st,
+                       command=lambda it=item: self.begin_add_subitem(it)
+                       ).pack(side="right", padx=(0, 4))
 
         for sub in item.get("subitems", []):
             srow = ttk.Frame(block)
             srow.pack(fill="x", padx=(28, 0))
             svar = tk.BooleanVar(value=bool(sub.get("checked")))
-            ttk.Checkbutton(srow, text=sub["text"], variable=svar, state=st,
-                            command=lambda s=sub, v=svar: app.toggle_subitem(s, v)
-                            ).pack(side="left")
-            ttk.Button(srow, text="✕", width=2, state=st,
-                       command=lambda it=item, s=sub: app.delete_subitem(task, it, s)
-                       ).pack(side="right")
+            scb = ttk.Checkbutton(srow, text=sub["text"], variable=svar, state=st,
+                                  command=lambda s=sub, v=svar: app.toggle_subitem(s, v))
+            scb.pack(side="left")
+            self._item_cbs[("sub", sub["id"])] = scb
+            if self.edit_mode:
+                ttk.Button(srow, text="✕", width=2, state=st,
+                           command=lambda it=item, s=sub: self.remove_subitem(it, s)
+                           ).pack(side="right")
+
+    # ---- 편집 모드 토글 (트랜잭션: 종료 시 저장/취소) --------------------
+    def _toggle_edit(self):
+        """'수정' 버튼 → 켜면 항목 편집 버튼이 보이고, 끌 때 바뀐 게 있으면
+        저장/취소를 묻는다. 취소하면 진입 시점 상태로 되돌린다."""
+        turning_on = bool(self.edit_var.get())
+        if turning_on:
+            # 진입 시점의 항목 상태를 사본으로 보관(취소 시 복구용).
+            self._snapshot = {
+                "items": copy.deepcopy(self.task.get("items", [])),
+                "next_item_id": self.task.get("next_item_id", 1),
+            }
+            self.edit_mode = True
+            self.rebuild()
+            return
+
+        # 편집 모드 종료
+        self.edit_mode = False
+        changed = (self._snapshot is not None and
+                   self.task.get("items", []) != self._snapshot["items"])
+        if changed:
+            keep = messagebox.askyesno(
+                "수정 저장", "수정한 내용을 저장하시겠습니까?", parent=self.app.root)
+            if not keep:
+                # 취소 → 진입 시점으로 복구
+                self.task["items"] = self._snapshot["items"]
+                self.task["next_item_id"] = self._snapshot["next_item_id"]
+            self.app.save()
+        self._snapshot = None
+        self.rebuild()
+        self.app._refresh_overall()
+
+    # ---- 수정 모드 안의 항목 추가/삭제 (확인창·입력창 없이 인라인) -------
+    def begin_add_item(self):
+        """빈 항목을 추가하고, 그 자리에서 제목을 바로 입력하도록 한다."""
+        task = self.task
+        nid = self.app._new_item_id(task)
+        task.setdefault("items", []).append(
+            {"id": nid, "text": "", "checked": False, "group": "", "subitems": []})
+        self.app.save()
+        self._edit_new = ("item", nid)
+        self.rebuild()
+
+    def begin_add_subitem(self, item):
+        """빈 세부 항목을 추가하고, 그 자리에서 내용을 바로 입력하도록 한다."""
+        nid = self.app._new_item_id(self.task)
+        item.setdefault("subitems", []).append(
+            {"id": nid, "text": "", "checked": False})
+        self.app.save()
+        self._edit_new = ("sub", nid)
+        self.rebuild()
+
+    def remove_item(self, item):
+        self.task["items"] = [it for it in self.task.get("items", [])
+                              if it is not item]
+        self.app.save()
+        self.rebuild()
+        self.app._refresh_overall()
+
+    def remove_subitem(self, item, sub):
+        item["subitems"] = [s for s in item.get("subitems", []) if s is not sub]
+        self.app.save()
+        self.rebuild()
+        self.app._refresh_overall()
+
+    # ---- 새 항목 제목 인라인 입력 ----------------------------------------
+    def _find_obj(self, key):
+        kind, oid = key
+        if kind == "item":
+            return next((it for it in self.task.get("items", [])
+                         if it["id"] == oid), None)
+        for it in self.task.get("items", []):
+            for s in it.get("subitems", []):
+                if s["id"] == oid:
+                    return s
+        return None
+
+    def _drop_obj(self, key):
+        """빈 채로 취소된 새 항목/세부 항목을 제거한다."""
+        kind, oid = key
+        if kind == "item":
+            self.task["items"] = [it for it in self.task.get("items", [])
+                                  if it["id"] != oid]
+            return
+        for it in self.task.get("items", []):
+            subs = it.get("subitems", [])
+            if any(s["id"] == oid for s in subs):
+                it["subitems"] = [s for s in subs if s["id"] != oid]
+                return
+
+    def _maybe_start_inline_edit(self):
+        key = self._edit_new
+        if key is None:
+            return
+        cb = self._item_cbs.get(key)
+        if cb is None or not cb.winfo_exists():
+            self._edit_new = None
+            return
+        row = cb.master
+        row.update_idletasks()
+        x, y, h = cb.winfo_x(), cb.winfo_y(), cb.winfo_height()
+        entry = ttk.Entry(row, width=24)
+        entry.place(x=x, y=y, height=h)
+        entry.focus_set()
+        done = {"closed": False}
+
+        def commit(event=None):
+            if done["closed"]:
+                return
+            done["closed"] = True
+            val = entry.get().strip()
+            entry.destroy()
+            self._edit_new = None
+            obj = self._find_obj(key)
+            if val and obj is not None:
+                obj["text"] = val
+                self.app.save()
+                if cb.winfo_exists():
+                    cb.config(text=val)       # 체크박스 글자만 갱신(재생성 불필요)
+            else:
+                self._drop_obj(key)           # 빈 값 → 방금 추가한 항목 취소
+                self.app.save()
+                self.app.root.after_idle(self.rebuild)
+            self.app._refresh_overall()
+
+        def cancel(event=None):
+            if done["closed"]:
+                return
+            done["closed"] = True
+            entry.destroy()
+            self._edit_new = None
+            self._drop_obj(key)
+            self.app.save()
+            self.app.root.after_idle(self.rebuild)
+
+        entry.bind("<Return>", commit)
+        entry.bind("<KP_Enter>", commit)
+        entry.bind("<Escape>", cancel)
+        entry.bind("<FocusOut>", commit)
 
     # ---- 부분 갱신 (깜빡임 없음) -----------------------------------------
     def _refit_title(self, event=None):
@@ -649,6 +824,10 @@ class TaskCard:
         if avail <= 1:        # 아직 배치 전 — 폭이 정해지면 Configure 가 다시 부른다.
             return
         full = self.task.get("title") or "(제목 없음)"
+        # 폭·제목이 그대로면 다시 계산하지 않는다(리사이즈 중 중복 호출 방지).
+        if self._last_title_fit == (avail, full):
+            return
+        self._last_title_fit = (avail, full)
         font = self.app.title_font
         if font.measure(full) <= avail:
             text = full
@@ -669,13 +848,25 @@ class TaskCard:
             done, total = self.app.task_progress(self.task)
             self.prog_lbl.config(text="{}/{}".format(done, total))
 
-    def update_position(self, position):
-        """드래그 정렬 후 순위 배지(#N·색)만 갱신."""
-        self.position = position
+    def _show_priority_menu(self, event):
+        """배지 우클릭 → 우선순위 1/2/3 선택 메뉴."""
+        menu = tk.Menu(self.rank_lbl, tearoff=0)
+        for v in (1, 2, 3):
+            menu.add_command(label="우선순위 {}".format(v),
+                             foreground=self._rank_color(v, False),
+                             command=lambda val=v: self.set_priority(val))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def set_priority(self, value):
+        """우선순위 변경 → 배지 글자·색만 갱신(재생성 없음). 드래그 순서엔 영향 없음."""
+        self.task["priority"] = value
+        self.app.save()
         if self.rank_lbl is not None and self.rank_lbl.winfo_exists():
             dimmed = self.task.get("status") in STATUS_DIMMED
-            self.rank_lbl.config(text=str(position),
-                                 bg=self._rank_color(position, dimmed))
+            self.rank_lbl.config(text=str(value), bg=self._rank_color(value, dimmed))
 
     def set_drag_highlight(self, on):
         """드래그 중 강조 — 테두리 두께는 그대로 두고 relief 만 바꿔 밀림 방지."""
@@ -710,6 +901,7 @@ class ChecklistApp:
         self.cards = {}              # {task_id: TaskCard} — 리스트 카드 객체들
         self._width_after = None     # 폭 갱신 디바운스 핸들
         self._last_canvas_w = None
+        self._scroll_after = None    # scrollregion 갱신 디바운스 핸들
 
         self._build_ui()
         saved_geo = self.data.get("geometry")
@@ -737,27 +929,24 @@ class ChecklistApp:
 
     # ---- UI 골격 ----------------------------------------------------------
     def _build_ui(self):
-        # 전체 진행률 행: 왼쪽엔 진행률 텍스트+바, 오른쪽엔 [항상 위][+ 리스트].
         overall = ttk.Frame(self.root, padding=(8, 6))
         overall.pack(fill="x")
 
-        # 오른쪽 컨트롤 (먼저 pack 해야 왼쪽 영역이 남은 폭을 채운다)
-        controls = ttk.Frame(overall)
-        controls.pack(side="right", padx=(8, 0))
-        ttk.Button(controls, text="+ 리스트",
+        # 상단 글자줄: 왼쪽 '전체 진행률' 텍스트, 오른쪽 [항상 위][+ 리스트].
+        toprow = ttk.Frame(overall)
+        toprow.pack(fill="x")
+        ttk.Button(toprow, text="+ 리스트",
                    command=self.add_task).pack(side="right")
         self.top_var = tk.BooleanVar(value=bool(self.data.get("always_on_top", True)))
-        ttk.Checkbutton(controls, text="항상 위", variable=self.top_var,
+        ttk.Checkbutton(toprow, text="항상 위", variable=self.top_var,
                         command=self.toggle_always_on_top).pack(side="right", padx=(0, 8))
-
-        # 왼쪽 진행률 영역 (텍스트 위, 바 아래)
-        meter = ttk.Frame(overall)
-        meter.pack(side="left", fill="x", expand=True)
         self.overall_var = tk.StringVar(value="전체 진행률  0/0  (0%)")
-        ttk.Label(meter, textvariable=self.overall_var,
-                  font=("Segoe UI", 9)).pack(anchor="w")
-        self.overall_bar = ttk.Progressbar(meter, maximum=100)
-        self.overall_bar.pack(fill="x", pady=(2, 0))
+        ttk.Label(toprow, textvariable=self.overall_var,
+                  font=("Segoe UI", 9)).pack(side="left")
+
+        # 진행 바: 글자줄 아래, 전체 폭.
+        self.overall_bar = ttk.Progressbar(overall, maximum=100)
+        self.overall_bar.pack(fill="x", pady=(4, 0))
 
         ttk.Separator(self.root).pack(fill="x")
 
@@ -771,11 +960,23 @@ class ChecklistApp:
 
         self.body = ttk.Frame(self.canvas, padding=8)
         self.body_window = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
-        self.body.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        # 리사이즈 중 본문 Configure 가 연속으로 쏟아질 때 scrollregion 재계산을
+        # 매번 하면 무겁다. 50ms로 합쳐 마지막 한 번만 계산한다(디바운스).
+        self.body.bind("<Configure>", self._queue_scrollregion)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def _queue_scrollregion(self, event=None):
+        if self._scroll_after is not None:
+            self.root.after_cancel(self._scroll_after)
+        self._scroll_after = self.root.after(50, self._apply_scrollregion)
+
+    def _apply_scrollregion(self):
+        self._scroll_after = None
+        try:
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        except Exception:  # noqa: BLE001
+            pass
 
     def _on_canvas_configure(self, event):
         # 폭이 바뀔 때마다 본문 전체를 재배치하면 무겁다. 같은 폭이면 건너뛰고,
@@ -863,6 +1064,8 @@ class ChecklistApp:
         for i in range(count):
             # 개수>1이고 제목이 있으면 1,2,3 … 을 붙여 구별
             title = "{} {}".format(name, i + 1) if (count > 1 and name) else name
+            # 우선순위 기본값: 생성 순서대로 1,2,3 … 4번째부터는 고정 3.
+            priority = min(len(self.data["tasks"]) + 1, 3)
             self.data["tasks"].append({
                 "id": self.data["next_id"],
                 "title": title,
@@ -870,6 +1073,7 @@ class ChecklistApp:
                 "categories": list(cats),
                 "status": "진행",
                 "collapsed": False,
+                "priority": priority,
                 "items": [],            # 빈 체크리스트로 시작
                 "next_item_id": 1,
             })
@@ -970,44 +1174,8 @@ class ChecklistApp:
         task["next_item_id"] = nid + 1
         return nid
 
-    def add_item(self, task):
-        text = simpledialog.askstring("항목 추가", "항목 내용:", parent=self.root)
-        if not text or not text.strip():
-            return
-        task.setdefault("items", []).append(
-            {"id": self._new_item_id(task), "text": text.strip(),
-             "checked": False, "group": "", "subitems": []})
-        self.save()
-        self._rebuild_card(task)
-        self._refresh_overall()
-
-    def add_subitem(self, task, item):
-        text = simpledialog.askstring("세부 항목 추가", "세부 내용:", parent=self.root)
-        if not text or not text.strip():
-            return
-        item.setdefault("subitems", []).append(
-            {"id": self._new_item_id(task), "text": text.strip(), "checked": False})
-        self.save()
-        self._rebuild_card(task)
-        self._refresh_overall()
-
-    def delete_item(self, task, item):
-        if not messagebox.askyesno("항목 삭제",
-                                   "'{}' 삭제 (복구 불가)".format(item["text"])):
-            return
-        task["items"] = [it for it in task.get("items", []) if it is not item]
-        self.save()
-        self._rebuild_card(task)
-        self._refresh_overall()
-
-    def delete_subitem(self, task, item, sub):
-        if not messagebox.askyesno("세부 항목 삭제",
-                                   "'{}' 삭제 (복구 불가)".format(sub["text"])):
-            return
-        item["subitems"] = [s for s in item.get("subitems", []) if s is not sub]
-        self.save()
-        self._rebuild_card(task)
-        self._refresh_overall()
+    # 항목 추가/삭제는 카드의 '수정' 모드 안에서 TaskCard 가 직접 처리한다
+    # (begin_add_item / begin_add_subitem / remove_item / remove_subitem).
 
     def toggle_item(self, item, var):
         item["checked"] = bool(var.get())
@@ -1090,14 +1258,6 @@ class ChecklistApp:
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         self.root.after_idle(self._clamp_scroll)
 
-    def _reindex(self):
-        """드래그 정렬 뒤, 각 카드의 순위 배지(#N·색)만 갱신한다(재생성 없음)."""
-        for position, task in enumerate(self.data["tasks"], start=1):
-            card = self.cards.get(task["id"])
-            if card is not None:
-                card.update_position(position)
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-
     def _clamp_scroll(self):
         """내용이 화면에 다 들어오면 스크롤을 맨 위로 — 모두 접었을 때 위쪽
         빈 공간이 남아 카드가 아래로 쏠려 보이는 현상 방지."""
@@ -1167,7 +1327,9 @@ class ChecklistApp:
                     card.frame.pack_forget()
                     card.frame.pack(fill="x", pady=(0, 8))
             self.body.update_idletasks()
-            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            # scrollregion 은 여기서 건드리지 않는다. 순서만 바뀌어 전체 높이는
+            # 그대로인데, 드래그 중 매번 재설정하면 canvas 가 스크롤 위치를 보정하며
+            # 위쪽에 빈칸을 만드는 현상이 생긴다(특히 위로 끌 때).
 
     def _drag_end(self, event):
         if not self._drag:
@@ -1178,7 +1340,9 @@ class ChecklistApp:
             card.set_drag_highlight(False)
         self._drag = None
         self.save()
-        self._reindex()  # 표시 번호(#N)·우선순위 색만 갱신 (전체 재생성 없음)
+        # 정렬이 끝난 뒤 한 번만 scrollregion 재계산 + 위쪽 빈칸 방지.
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self._clamp_scroll()
 
     # ---- 항목 드래그 정렬 (업무 내부) ------------------------------------
     def _item_drag_start(self, event, task, item):
@@ -1220,7 +1384,8 @@ class ChecklistApp:
                     block.pack_forget()
                     block.pack(fill="x")
             self.body.update_idletasks()
-            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            # 항목 순서만 바뀌어 전체 높이는 그대로 — scrollregion 은 건드리지 않는다
+            # (드래그 중 재설정 시 위쪽 빈칸이 생기는 현상 방지).
 
     def _item_drag_end(self, event):
         if not self._item_drag:
