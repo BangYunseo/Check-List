@@ -17,6 +17,7 @@ import sys
 try:
     import tkinter as tk
     from tkinter import ttk, messagebox, simpledialog
+    import tkinter.font as tkfont
 except ImportError:  # tkinter 미설치 환경
     sys.stderr.write(
         "이 프로그램은 tkinter가 필요합니다. "
@@ -410,28 +411,303 @@ class TaskDialog(tk.Toplevel):
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 4. 메인 애플리케이션
+# 4. 리스트 카드 (한 개의 업무를 책임지는 객체)
+#    위젯을 한 번만 만들고, 이후엔 바뀐 부분만 스스로 갱신한다.
+#    - 제목/진행률/순위 배지: 해당 위젯만 config (깜빡임 없음)
+#    - 상태/접기/항목 변경: 자기 카드 '안'만 다시 그린다(rebuild) — 전체 화면을
+#      destroy 후 재생성하지 않으므로 다른 카드는 그대로다.
+# ──────────────────────────────────────────────────────────────────────────
+
+class TaskCard:
+    def __init__(self, app, task):
+        self.app = app
+        self.task = task
+        self.position = 0
+        self.frame = None          # 카드 바깥 프레임 (app.body 에 pack)
+        self.rank_lbl = None       # 순위 배지 (#N, 색)
+        self.title_lbl = None      # 제목 라벨
+        self.prog_lbl = None       # 진행률 (n/m)
+        self.item_blocks = {}      # {item_id: block Frame} — 항목 드래그 정렬용
+
+    # ---- 생성 / 재생성 ----------------------------------------------------
+    def build(self, position):
+        """카드 바깥 프레임을 만들어 body 에 붙이고 내용을 채운다."""
+        self.frame = ttk.Frame(self.app.body, relief="solid",
+                               borderwidth=1, padding=6)
+        self.frame.pack(fill="x", pady=(0, 8))
+        self._populate(position)
+        return self.frame
+
+    def rebuild(self, position=None):
+        """프레임은 그 자리에 두고 내용만 새로 그린다(이 카드 1개만 잠깐 바뀜).
+        상태/접기/항목처럼 카드 내부 구조가 달라질 때 호출한다."""
+        if self.frame is None or not self.frame.winfo_exists():
+            return
+        if position is None:
+            position = self.position
+        for child in self.frame.winfo_children():
+            child.destroy()
+        self.item_blocks = {}
+        self._populate(position)
+        # 높이 변화 → body <Configure> 가 scrollregion 을 알아서 갱신.
+
+    @staticmethod
+    def _rank_color(position, dimmed):
+        if dimmed:
+            return "#9aa0a6"
+        return {1: "#d9342b", 2: "#e8821e", 3: "#caa200"}.get(position, "#9aa0a6")
+
+    def _populate(self, position):
+        self.position = position
+        app, task = self.app, self.task
+
+        header = ttk.Frame(self.frame)
+        header.pack(fill="x")
+
+        # 업무 드래그 핸들 (우선순위 정렬)
+        handle = ttk.Label(header, text="↕", cursor="fleur", foreground="#999")
+        handle.pack(side="left", padx=(0, 2))
+        handle.bind("<ButtonPress-1>", lambda e: app._drag_start(task))
+        handle.bind("<B1-Motion>", app._drag_motion)
+        handle.bind("<ButtonRelease-1>", app._drag_end)
+
+        arrow = "▶" if task.get("collapsed") else "▼"
+        ttk.Button(header, text=arrow, width=2,
+                   command=lambda: app.toggle_collapse(task)).pack(side="left")
+
+        dimmed = task.get("status") in STATUS_DIMMED
+        # '제외'면 잠금: 상태 변경과 드래그만 허용하고 내부 편집은 전부 막는다.
+        locked = task.get("status") == "제외"
+        # 위로 끌수록 높은 우선순위. 상위 3개를 색 배지로 구분.
+        self.rank_lbl = tk.Label(header, text=str(position),
+                                 bg=self._rank_color(position, dimmed), fg="white",
+                                 font=("Segoe UI", 9, "bold"), padx=6)
+        self.rank_lbl.pack(side="left", padx=(6, 4))
+
+        # 제목 라벨은 생성만 해두고 '맨 마지막에' pack 한다. 그래야 폭이 좁아질 때
+        # 고정 버튼들이 먼저 자리를 차지하고, 남는 가운데 공간만 제목이 차지한다
+        # (= 제목이 잘릴지언정 버튼은 절대 가려지지 않음). 길면 '…'로 줄인다.
+        self.title_lbl = ttk.Label(header, text=task.get("title") or "(제목 없음)",
+                                   font=app.title_font, cursor="hand2", anchor="w",
+                                   foreground=("#999" if dimmed else "#000"))
+        # 제목 더블클릭 → 이름 바로 수정 (잠금 시 비활성)
+        if not locked:
+            self.title_lbl.bind(
+                "<Double-Button-1>",
+                lambda e: app.rename_task(task, self.title_lbl))
+
+        # 오른쪽: 삭제 / 수정 / 상태 / 진행률 / 유형 (오른쪽 끝부터 차례로)
+        ttk.Button(header, text="🗑", width=3,
+                   command=lambda: app.delete_task(task)).pack(side="right")
+        ttk.Button(header, text="✎", width=3,
+                   state=("disabled" if locked else "normal"),
+                   command=lambda: app.edit_task(task)).pack(side="right", padx=(0, 4))
+        status = task.get("status", "진행")
+        smb = tk.Menubutton(header, text=status,
+                            bg=STATUS_COLORS.get(status, "#666"),
+                            fg="white", font=("Segoe UI", 8, "bold"),
+                            relief="raised", padx=6, takefocus=0)
+        smenu = tk.Menu(smb, tearoff=0)
+        for s in STATUS_ORDER:
+            smenu.add_command(label=s, foreground=STATUS_COLORS.get(s, "#000"),
+                              command=lambda val=s: app.set_status(task, val))
+        smb["menu"] = smenu
+        smb.pack(side="right", padx=(0, 6))
+        done, total = app.task_progress(task)
+        self.prog_lbl = ttk.Label(header, text="{}/{}".format(done, total),
+                                  foreground="#555")
+        self.prog_lbl.pack(side="right", padx=(0, 8))
+        if task.get("kind"):
+            ttk.Label(header, text=task["kind"],
+                      foreground=KIND_COLORS.get(task["kind"], "#666"),
+                      font=("Segoe UI", 8)).pack(side="right", padx=(6, 0))
+
+        # 남는 가운데 공간을 제목이 차지(잘리면 '…'). Configure 마다 다시 맞춘다.
+        self.title_lbl.pack(side="left", fill="x", expand=True)
+        self.title_lbl.bind("<Configure>", self._refit_title)
+
+        if task.get("collapsed"):
+            return
+
+        # 본문 컨트롤: 항목 추가 + 프리셋 불러오기
+        controls = ttk.Frame(self.frame)
+        controls.pack(fill="x", pady=(6, 2))
+        ttk.Button(controls, text="+ 항목",
+                   state=("disabled" if locked else "normal"),
+                   command=lambda: app.add_item(task)).pack(side="left")
+        self._build_preset_menu(controls, locked)
+
+        items = task.setdefault("items", [])
+        if not items:
+            ttk.Label(self.frame, text="항목 없음 — [+ 항목] 또는 [프리셋 불러오기]",
+                      foreground="#999").pack(anchor="w", padx=(4, 0), pady=(2, 0))
+            return
+
+        # 카테고리(group)별로 묶어서 표시. 그룹이 2개 이상일 때만 칸 헤더를 보인다
+        # (단일 카테고리/자유 항목이면 헤더 없이 평탄하게).
+        def group_rank(g):
+            if g == "공통":
+                return (0, 0)
+            if g in CATEGORY_ORDER:
+                return (1, CATEGORY_ORDER.index(g))
+            if g == "":
+                return (3, 0)
+            return (2, 0)
+
+        present = []
+        for it in items:
+            g = it.get("group", "")
+            if g not in present:
+                present.append(g)
+        present.sort(key=group_rank)
+        multi = len(present) > 1
+
+        for g in present:
+            if multi:
+                label = "[{}]".format(g) if g else "[직접 작성]"
+                ttk.Label(self.frame, text=label, foreground="#3a6ea5",
+                          font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(6, 1))
+            for item in [it for it in items if it.get("group", "") == g]:
+                self._render_item_block(item, locked)
+
+    def _build_preset_menu(self, parent, locked=False):
+        app, task = self.app, self.task
+        mb = ttk.Menubutton(parent, text="프리셋 불러오기 ▾",
+                            state=("disabled" if locked else "normal"))
+        menu = tk.Menu(mb, tearoff=0)
+        menu.add_command(
+            label="공통",
+            command=lambda: app.load_preset(task, COMMON_ITEMS, "공통"))
+        # 업무의 카테고리를 위에, 나머지 카테고리를 아래에 — 어떤 칸이든 불러올 수 있게.
+        cats = list(task.get("categories", []))
+        for c in CATEGORY_ORDER:
+            if c not in cats:
+                cats.append(c)
+        for cat in cats:
+            tpl = CATEGORY_TEMPLATES.get(cat)
+            if not tpl:
+                continue
+            menu.add_separator()
+            for kind in KIND_ORDER:
+                texts = tpl.get(kind, [])
+                if texts:
+                    menu.add_command(
+                        label="{} · {}".format(cat, kind),
+                        command=lambda x=texts, g=cat: app.load_preset(task, x, g))
+        mb["menu"] = menu
+        mb.pack(side="left", padx=(6, 0))
+
+    def _render_item_block(self, item, locked=False):
+        """항목 1개 + 그 하위 항목들을 하나의 블록으로 묶는다(드래그 정렬 단위).
+        locked(제외)면 체크·추가·삭제는 막고 드래그 정렬만 허용한다."""
+        app, task = self.app, self.task
+        st = "disabled" if locked else "normal"
+        block = ttk.Frame(self.frame)
+        block.pack(fill="x")
+        self.item_blocks[item["id"]] = block
+
+        row = ttk.Frame(block)
+        row.pack(fill="x")
+
+        # 항목 드래그 핸들 (업무 내부 정렬) — 잠금 상태에서도 드래그는 허용
+        ih = ttk.Label(row, text="↕", cursor="fleur", foreground="#bbb")
+        ih.pack(side="left", padx=(2, 2))
+        ih.bind("<ButtonPress-1>",
+                lambda e, it=item: app._item_drag_start(e, task, it))
+        ih.bind("<B1-Motion>", app._item_drag_motion)
+        ih.bind("<ButtonRelease-1>", app._item_drag_end)
+
+        var = tk.BooleanVar(value=bool(item.get("checked")))
+        ttk.Checkbutton(row, text=item["text"], variable=var, state=st,
+                        command=lambda it=item, v=var: app.toggle_item(it, v)
+                        ).pack(side="left")
+        ttk.Button(row, text="✕", width=2, state=st,
+                   command=lambda it=item: app.delete_item(task, it)
+                   ).pack(side="right")
+        ttk.Button(row, text="+세부", width=5, state=st,
+                   command=lambda it=item: app.add_subitem(task, it)
+                   ).pack(side="right", padx=(0, 4))
+
+        for sub in item.get("subitems", []):
+            srow = ttk.Frame(block)
+            srow.pack(fill="x", padx=(28, 0))
+            svar = tk.BooleanVar(value=bool(sub.get("checked")))
+            ttk.Checkbutton(srow, text=sub["text"], variable=svar, state=st,
+                            command=lambda s=sub, v=svar: app.toggle_subitem(s, v)
+                            ).pack(side="left")
+            ttk.Button(srow, text="✕", width=2, state=st,
+                       command=lambda it=item, s=sub: app.delete_subitem(task, it, s)
+                       ).pack(side="right")
+
+    # ---- 부분 갱신 (깜빡임 없음) -----------------------------------------
+    def _refit_title(self, event=None):
+        """라벨에 할당된 폭에 맞춰 제목을 '…'로 줄인다(폭이 좁아도 버튼 안 가림)."""
+        lbl = self.title_lbl
+        if lbl is None or not lbl.winfo_exists():
+            return
+        avail = lbl.winfo_width()
+        if avail <= 1:        # 아직 배치 전 — 폭이 정해지면 Configure 가 다시 부른다.
+            return
+        full = self.task.get("title") or "(제목 없음)"
+        font = self.app.title_font
+        if font.measure(full) <= avail:
+            text = full
+        else:
+            text = full
+            while text and font.measure(text + "…") > avail:
+                text = text[:-1]
+            text = (text + "…") if text else "…"
+        if lbl.cget("text") != text:
+            lbl.config(text=text)
+
+    def update_title(self):
+        if self.title_lbl is not None and self.title_lbl.winfo_exists():
+            self._refit_title()
+
+    def update_progress(self):
+        if self.prog_lbl is not None and self.prog_lbl.winfo_exists():
+            done, total = self.app.task_progress(self.task)
+            self.prog_lbl.config(text="{}/{}".format(done, total))
+
+    def update_position(self, position):
+        """드래그 정렬 후 순위 배지(#N·색)만 갱신."""
+        self.position = position
+        if self.rank_lbl is not None and self.rank_lbl.winfo_exists():
+            dimmed = self.task.get("status") in STATUS_DIMMED
+            self.rank_lbl.config(text=str(position),
+                                 bg=self._rank_color(position, dimmed))
+
+    def set_drag_highlight(self, on):
+        """드래그 중 강조 — 테두리 두께는 그대로 두고 relief 만 바꿔 밀림 방지."""
+        if self.frame is not None and self.frame.winfo_exists():
+            self.frame.configure(relief="raised" if on else "solid")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 5. 메인 애플리케이션
 # ──────────────────────────────────────────────────────────────────────────
 
 class ChecklistApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Check-List")
-        self.root.geometry("360x460")
+        self.root.geometry("400x460")
         # 크기 조절 허용 + 너비는 최소/최대로 제한(너무 넓어지지 않게).
+        # 최소 너비는 헤더 버튼들이 가려지지 않을 만큼 확보한다(너무 좁히면 잘림).
         # 높이는 항목이 많아질 수 있으니 화면 높이까지 허용.
         self.root.resizable(True, True)
-        self.root.minsize(320, 360)
+        self.root.minsize(400, 360)
         self.root.maxsize(560, self.root.winfo_screenheight())
+        # 제목 라벨 폭 측정용 폰트(같은 글꼴을 카드들이 공유) — 폭이 좁으면 제목을
+        # '…'로 줄여 버튼을 밀어내지 않게 한다.
+        self.title_font = tkfont.Font(family="Segoe UI", size=10, weight="bold")
 
         self.data, load_warn = load_data()
         self.save_error_shown = False
         self._geo_after = None       # 창 크기/위치 저장 디바운스 핸들
         self._drag = None            # 업무(카드) 드래그 상태
         self._item_drag = None       # 항목 드래그 상태
-        self._card_widgets = {}      # {task_id: card Frame}
-        self._item_blocks = {}       # {(task_id, item_id): block Frame}
-        self._progress_labels = {}
+        self.cards = {}              # {task_id: TaskCard} — 리스트 카드 객체들
         self._width_after = None     # 폭 갱신 디바운스 핸들
         self._last_canvas_w = None
 
@@ -461,22 +737,26 @@ class ChecklistApp:
 
     # ---- UI 골격 ----------------------------------------------------------
     def _build_ui(self):
-        toolbar = ttk.Frame(self.root, padding=(8, 6))
-        toolbar.pack(fill="x")
+        # 전체 진행률 행: 왼쪽엔 진행률 텍스트+바, 오른쪽엔 [항상 위][+ 리스트].
+        overall = ttk.Frame(self.root, padding=(8, 6))
+        overall.pack(fill="x")
 
-        ttk.Button(toolbar, text="+ 리스트", command=self.add_task).pack(side="right")
+        # 오른쪽 컨트롤 (먼저 pack 해야 왼쪽 영역이 남은 폭을 채운다)
+        controls = ttk.Frame(overall)
+        controls.pack(side="right", padx=(8, 0))
+        ttk.Button(controls, text="+ 리스트",
+                   command=self.add_task).pack(side="right")
         self.top_var = tk.BooleanVar(value=bool(self.data.get("always_on_top", True)))
-        ttk.Checkbutton(toolbar, text="항상 위", variable=self.top_var,
+        ttk.Checkbutton(controls, text="항상 위", variable=self.top_var,
                         command=self.toggle_always_on_top).pack(side="right", padx=(0, 8))
 
-        ttk.Separator(self.root).pack(fill="x")
-
-        overall = ttk.Frame(self.root, padding=(8, 4))
-        overall.pack(fill="x")
+        # 왼쪽 진행률 영역 (텍스트 위, 바 아래)
+        meter = ttk.Frame(overall)
+        meter.pack(side="left", fill="x", expand=True)
         self.overall_var = tk.StringVar(value="전체 진행률  0/0  (0%)")
-        ttk.Label(overall, textvariable=self.overall_var,
+        ttk.Label(meter, textvariable=self.overall_var,
                   font=("Segoe UI", 9)).pack(anchor="w")
-        self.overall_bar = ttk.Progressbar(overall, maximum=100)
+        self.overall_bar = ttk.Progressbar(meter, maximum=100)
         self.overall_bar.pack(fill="x", pady=(2, 0))
 
         ttk.Separator(self.root).pack(fill="x")
@@ -609,17 +889,53 @@ class ChecklistApp:
         task["kind"] = kind
         task["categories"] = cats  # 항목(items)은 사용자 소유이므로 건드리지 않음
         self.save()
-        self.render()
+        self._rebuild_card(task)
 
-    def rename_task(self, task):
-        """제목 더블클릭 → 이름만 바로 수정."""
-        name = simpledialog.askstring("제목 수정", "제목:", parent=self.root,
-                                      initialvalue=task.get("title", ""))
-        if name is None:
-            return
-        task["title"] = name.strip()
-        self.save()
-        self.render()
+    def _rebuild_card(self, task):
+        """카드 1개만 다시 그린다(없으면 전체 render 로 폴백)."""
+        card = self.cards.get(task["id"])
+        if card is not None:
+            card.rebuild()
+        else:
+            self.render()
+
+    def rename_task(self, task, label):
+        """제목 더블클릭 → 라벨 자리에 입력창을 띄워 바로 수정 (다이얼로그 없이)."""
+        header = label.master
+        header.update_idletasks()
+        x, y, h = label.winfo_x(), label.winfo_y(), label.winfo_height()
+
+        entry = ttk.Entry(header, width=30, font=("Segoe UI", 10, "bold"))
+        entry.insert(0, task.get("title", ""))
+        entry.select_range(0, "end")
+        entry.place(x=x, y=y, height=h)
+        entry.focus_set()
+
+        done = {"closed": False}
+
+        def commit(event=None):
+            if done["closed"]:
+                return
+            done["closed"] = True
+            name = entry.get().strip()
+            entry.destroy()
+            if name and name != task.get("title", ""):
+                task["title"] = name
+                self.save()
+                card = self.cards.get(task["id"])
+                if card is not None:
+                    card.update_title()  # 제목 라벨만 갱신 (깜빡임 없음)
+
+        def cancel(event=None):
+            if done["closed"]:
+                return
+            done["closed"] = True
+            entry.destroy()
+
+        entry.bind("<Return>", commit)
+        entry.bind("<KP_Enter>", commit)
+        entry.bind("<Escape>", cancel)
+        entry.bind("<FocusOut>", commit)
 
     def delete_task(self, task):
         position = next((i for i, t in enumerate(self.data["tasks"], start=1)
@@ -636,14 +952,17 @@ class ChecklistApp:
     def set_status(self, task, value):
         task["status"] = value
         self.save()
-        # 렌더는 메뉴가 완전히 닫힌 뒤로 미룬다. 메뉴 콜백 안에서 곧장 render()를
-        # 호출하면 닫히는 중인 메뉴/메뉴버튼을 파괴해 Tk가 꼬이고 팅긴다.
-        self.root.after_idle(self.render)
+        # 갱신은 메뉴가 완전히 닫힌 뒤로 미룬다. 메뉴 콜백 안에서 곧장 다시 그리면
+        # 닫히는 중인 메뉴/메뉴버튼을 파괴해 Tk가 꼬이고 팅긴다.
+        def apply():
+            self._rebuild_card(task)   # 상태에 따라 잠금/흐림/색이 달라져 카드 재구성
+            self._refresh_overall()    # 종료/제외는 전체 진행률에서 빠지므로 갱신
+        self.root.after_idle(apply)
 
     def toggle_collapse(self, task):
         task["collapsed"] = not task.get("collapsed", False)
         self.save()
-        self.render()
+        self._rebuild_card(task)
 
     # ---- 항목 / 하위 항목 -------------------------------------------------
     def _new_item_id(self, task):
@@ -659,7 +978,8 @@ class ChecklistApp:
             {"id": self._new_item_id(task), "text": text.strip(),
              "checked": False, "group": "", "subitems": []})
         self.save()
-        self.render()
+        self._rebuild_card(task)
+        self._refresh_overall()
 
     def add_subitem(self, task, item):
         text = simpledialog.askstring("세부 항목 추가", "세부 내용:", parent=self.root)
@@ -668,7 +988,8 @@ class ChecklistApp:
         item.setdefault("subitems", []).append(
             {"id": self._new_item_id(task), "text": text.strip(), "checked": False})
         self.save()
-        self.render()
+        self._rebuild_card(task)
+        self._refresh_overall()
 
     def delete_item(self, task, item):
         if not messagebox.askyesno("항목 삭제",
@@ -676,15 +997,17 @@ class ChecklistApp:
             return
         task["items"] = [it for it in task.get("items", []) if it is not item]
         self.save()
-        self.render()
+        self._rebuild_card(task)
+        self._refresh_overall()
 
-    def delete_subitem(self, item, sub):
+    def delete_subitem(self, task, item, sub):
         if not messagebox.askyesno("세부 항목 삭제",
                                    "'{}' 삭제 (복구 불가)".format(sub["text"])):
             return
         item["subitems"] = [s for s in item.get("subitems", []) if s is not sub]
         self.save()
-        self.render()
+        self._rebuild_card(task)
+        self._refresh_overall()
 
     def toggle_item(self, item, var):
         item["checked"] = bool(var.get())
@@ -708,7 +1031,8 @@ class ChecklistApp:
                  "checked": False, "group": group, "subitems": []})
             existing.add(text)
         self.save()
-        self.render()
+        self._rebuild_card(task)
+        self._refresh_overall()
 
     # ---- 진행률 -----------------------------------------------------------
     @staticmethod
@@ -725,11 +1049,8 @@ class ChecklistApp:
         return done, total
 
     def _refresh_progress(self):
-        for task in self.data["tasks"]:
-            lbl = self._progress_labels.get(task["id"])
-            if lbl is not None:
-                done, total = self.task_progress(task)
-                lbl.config(text="{}/{}".format(done, total))
+        for card in self.cards.values():
+            card.update_progress()
         self._refresh_overall()
 
     def _refresh_overall(self):
@@ -747,11 +1068,12 @@ class ChecklistApp:
 
     # ---- 렌더링 -----------------------------------------------------------
     def render(self):
+        """전체 화면을 처음부터 다시 그린다. 리스트 추가/삭제처럼 카드 '구성'이
+        바뀔 때만 호출한다. 카드 내부 변경(상태·제목·항목 등)은 카드 객체가
+        스스로 갱신하므로 이 메서드를 거치지 않는다 → 평소엔 깜빡임이 없다."""
         for child in self.body.winfo_children():
             child.destroy()
-        self._progress_labels = {}
-        self._card_widgets = {}
-        self._item_blocks = {}
+        self.cards = {}
         self._refresh_overall()
 
         if not self.data["tasks"]:
@@ -762,9 +1084,19 @@ class ChecklistApp:
             return
 
         for position, task in enumerate(self.data["tasks"], start=1):
-            self._render_task(task, position)
+            card = TaskCard(self, task)
+            card.build(position)
+            self.cards[task["id"]] = card
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         self.root.after_idle(self._clamp_scroll)
+
+    def _reindex(self):
+        """드래그 정렬 뒤, 각 카드의 순위 배지(#N·색)만 갱신한다(재생성 없음)."""
+        for position, task in enumerate(self.data["tasks"], start=1):
+            card = self.cards.get(task["id"])
+            if card is not None:
+                card.update_position(position)
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
     def _clamp_scroll(self):
         """내용이 화면에 다 들어오면 스크롤을 맨 위로 — 모두 접었을 때 위쪽
@@ -776,177 +1108,6 @@ class ChecklistApp:
                 self.canvas.yview_moveto(0)
         except Exception:  # noqa: BLE001
             pass
-
-    def _render_task(self, task, position):
-        card = ttk.Frame(self.body, relief="solid", borderwidth=1, padding=6)
-        card.pack(fill="x", pady=(0, 8))
-        self._card_widgets[task["id"]] = card
-
-        header = ttk.Frame(card)
-        header.pack(fill="x")
-
-        # 업무 드래그 핸들 (우선순위 정렬)
-        handle = ttk.Label(header, text="↕", cursor="fleur", foreground="#999")
-        handle.pack(side="left", padx=(0, 2))
-        handle.bind("<ButtonPress-1>", lambda e, t=task: self._drag_start(t))
-        handle.bind("<B1-Motion>", self._drag_motion)
-        handle.bind("<ButtonRelease-1>", self._drag_end)
-
-        arrow = "▶" if task.get("collapsed") else "▼"
-        ttk.Button(header, text=arrow, width=2,
-                   command=lambda t=task: self.toggle_collapse(t)).pack(side="left")
-
-        dimmed = task.get("status") in STATUS_DIMMED
-        # '제외'면 잠금: 상태 변경과 드래그만 허용하고 내부 편집은 전부 막는다.
-        locked = task.get("status") == "제외"
-        # 위로 끌수록 높은 우선순위. 상위 3개를 색 배지로 구분.
-        rank_color = ("#9aa0a6" if dimmed else
-                      {1: "#d9342b", 2: "#e8821e", 3: "#caa200"}.get(position, "#9aa0a6"))
-        tk.Label(header, text=str(position), bg=rank_color, fg="white",
-                 font=("Segoe UI", 9, "bold"), padx=6).pack(side="left", padx=(6, 4))
-        title_lbl = ttk.Label(header, text=task.get("title") or "(제목 없음)",
-                              font=("Segoe UI", 10, "bold"), cursor="hand2",
-                              foreground=("#999" if dimmed else "#000"))
-        title_lbl.pack(side="left")
-        # 제목 더블클릭 → 이름 바로 수정 (잠금 시 비활성)
-        if not locked:
-            title_lbl.bind("<Double-Button-1>", lambda e, t=task: self.rename_task(t))
-        if task.get("kind"):
-            ttk.Label(header, text=task["kind"],
-                      foreground=KIND_COLORS.get(task["kind"], "#666"),
-                      font=("Segoe UI", 8)).pack(side="left", padx=(6, 0))
-
-        # 오른쪽: 삭제 / 수정 / 상태 / 진행률
-        ttk.Button(header, text="🗑", width=3,
-                   command=lambda t=task: self.delete_task(t)).pack(side="right")
-        ttk.Button(header, text="✎", width=3,
-                   state=("disabled" if locked else "normal"),
-                   command=lambda t=task: self.edit_task(t)).pack(side="right", padx=(0, 4))
-        status = task.get("status", "진행")
-        smb = tk.Menubutton(header, text=status, bg=STATUS_COLORS.get(status, "#666"),
-                            fg="white", font=("Segoe UI", 8, "bold"),
-                            relief="raised", padx=6, takefocus=0)
-        smenu = tk.Menu(smb, tearoff=0)
-        for s in STATUS_ORDER:
-            smenu.add_command(label=s, foreground=STATUS_COLORS.get(s, "#000"),
-                              command=lambda t=task, val=s: self.set_status(t, val))
-        smb["menu"] = smenu
-        smb.pack(side="right", padx=(0, 6))
-        done, total = self.task_progress(task)
-        prog = ttk.Label(header, text="{}/{}".format(done, total), foreground="#555")
-        prog.pack(side="right", padx=(0, 8))
-        self._progress_labels[task["id"]] = prog
-
-        if task.get("collapsed"):
-            return
-
-        # 본문 컨트롤: 항목 추가 + 프리셋 불러오기
-        controls = ttk.Frame(card)
-        controls.pack(fill="x", pady=(6, 2))
-        ttk.Button(controls, text="+ 항목",
-                   state=("disabled" if locked else "normal"),
-                   command=lambda t=task: self.add_item(t)).pack(side="left")
-        self._build_preset_menu(controls, task, locked)
-
-        items = task.setdefault("items", [])
-        if not items:
-            ttk.Label(card, text="항목 없음 — [+ 항목] 또는 [프리셋 불러오기]",
-                      foreground="#999").pack(anchor="w", padx=(4, 0), pady=(2, 0))
-            return
-
-        # 카테고리(group)별로 묶어서 표시. 그룹이 2개 이상일 때만 칸 헤더를 보인다
-        # (단일 카테고리/자유 항목이면 헤더 없이 평탄하게).
-        def group_rank(g):
-            if g == "공통":
-                return (0, 0)
-            if g in CATEGORY_ORDER:
-                return (1, CATEGORY_ORDER.index(g))
-            if g == "":
-                return (3, 0)
-            return (2, 0)
-
-        present = []
-        for it in items:
-            g = it.get("group", "")
-            if g not in present:
-                present.append(g)
-        present.sort(key=group_rank)
-        multi = len(present) > 1
-
-        for g in present:
-            if multi:
-                label = "[{}]".format(g) if g else "[직접 작성]"
-                ttk.Label(card, text=label, foreground="#3a6ea5",
-                          font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(6, 1))
-            for item in [it for it in items if it.get("group", "") == g]:
-                self._render_item_block(card, task, item, locked)
-
-    def _build_preset_menu(self, parent, task, locked=False):
-        mb = ttk.Menubutton(parent, text="프리셋 불러오기 ▾",
-                            state=("disabled" if locked else "normal"))
-        menu = tk.Menu(mb, tearoff=0)
-        menu.add_command(
-            label="공통",
-            command=lambda t=task: self.load_preset(t, COMMON_ITEMS, "공통"))
-        # 업무의 카테고리를 위에, 나머지 카테고리를 아래에 — 어떤 칸이든 불러올 수 있게.
-        cats = list(task.get("categories", []))
-        for c in CATEGORY_ORDER:
-            if c not in cats:
-                cats.append(c)
-        for cat in cats:
-            tpl = CATEGORY_TEMPLATES.get(cat)
-            if not tpl:
-                continue
-            menu.add_separator()
-            for kind in KIND_ORDER:
-                texts = tpl.get(kind, [])
-                if texts:
-                    menu.add_command(
-                        label="{} · {}".format(cat, kind),
-                        command=lambda t=task, x=texts, g=cat: self.load_preset(t, x, g))
-        mb["menu"] = menu
-        mb.pack(side="left", padx=(6, 0))
-
-    def _render_item_block(self, card, task, item, locked=False):
-        """항목 1개 + 그 하위 항목들을 하나의 블록으로 묶는다(드래그 정렬 단위).
-        locked(제외)면 체크·추가·삭제는 막고 드래그 정렬만 허용한다."""
-        st = "disabled" if locked else "normal"
-        block = ttk.Frame(card)
-        block.pack(fill="x")
-        self._item_blocks[(task["id"], item["id"])] = block
-
-        row = ttk.Frame(block)
-        row.pack(fill="x")
-
-        # 항목 드래그 핸들 (업무 내부 정렬) — 잠금 상태에서도 드래그는 허용
-        ih = ttk.Label(row, text="↕", cursor="fleur", foreground="#bbb")
-        ih.pack(side="left", padx=(2, 2))
-        ih.bind("<ButtonPress-1>",
-                lambda e, t=task, it=item: self._item_drag_start(e, t, it))
-        ih.bind("<B1-Motion>", self._item_drag_motion)
-        ih.bind("<ButtonRelease-1>", self._item_drag_end)
-
-        var = tk.BooleanVar(value=bool(item.get("checked")))
-        ttk.Checkbutton(row, text=item["text"], variable=var, state=st,
-                        command=lambda it=item, v=var: self.toggle_item(it, v)
-                        ).pack(side="left")
-        ttk.Button(row, text="✕", width=2, state=st,
-                   command=lambda t=task, it=item: self.delete_item(t, it)
-                   ).pack(side="right")
-        ttk.Button(row, text="+세부", width=5, state=st,
-                   command=lambda t=task, it=item: self.add_subitem(t, it)
-                   ).pack(side="right", padx=(0, 4))
-
-        for sub in item.get("subitems", []):
-            srow = ttk.Frame(block)
-            srow.pack(fill="x", padx=(28, 0))
-            svar = tk.BooleanVar(value=bool(sub.get("checked")))
-            ttk.Checkbutton(srow, text=sub["text"], variable=svar, state=st,
-                            command=lambda s=sub, v=svar: self.toggle_subitem(s, v)
-                            ).pack(side="left")
-            ttk.Button(srow, text="✕", width=2, state=st,
-                       command=lambda it=item, s=sub: self.delete_subitem(it, s)
-                       ).pack(side="right")
 
     # ---- 드래그 고스트 (커서를 따라다니는 떠 있는 라벨) -------------------
     def _make_ghost(self, text, color="#d9342b"):
@@ -975,10 +1136,9 @@ class ChecklistApp:
     # ---- 업무(카드) 드래그 정렬 ------------------------------------------
     def _drag_start(self, task):
         self._drag = {"id": task["id"]}
-        card = self._card_widgets.get(task["id"])
-        if card and card.winfo_exists():
-            # 테두리 두께는 그대로 두고 relief만 바꿔 강조(크기 변화로 밀림 방지).
-            card.configure(relief="raised")
+        card = self.cards.get(task["id"])
+        if card is not None:
+            card.set_drag_highlight(True)
         label = task.get("title") or "(제목 없음)"
         self._drag["ghost"] = self._make_ghost("↕  " + label)
 
@@ -992,20 +1152,20 @@ class ChecklistApp:
         others = [t["id"] for t in tasks if t["id"] != drag_id]
         target = 0
         for tid in others:
-            card = self._card_widgets.get(tid)
-            if not card or not card.winfo_exists():
+            card = self.cards.get(tid)
+            if card is None or not card.frame.winfo_exists():
                 continue
-            if y > card.winfo_rooty() + card.winfo_height() / 2:
+            if y > card.frame.winfo_rooty() + card.frame.winfo_height() / 2:
                 target += 1
         new_order = others[:target] + [drag_id] + others[target:]
         if new_order != [t["id"] for t in tasks]:
             id_to_task = {t["id"]: t for t in tasks}
             self.data["tasks"] = [id_to_task[i] for i in new_order]
             for tid in new_order:
-                card = self._card_widgets.get(tid)
-                if card and card.winfo_exists():
-                    card.pack_forget()
-                    card.pack(fill="x", pady=(0, 8))
+                card = self.cards.get(tid)
+                if card is not None and card.frame.winfo_exists():
+                    card.frame.pack_forget()
+                    card.frame.pack(fill="x", pady=(0, 8))
             self.body.update_idletasks()
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
@@ -1013,12 +1173,12 @@ class ChecklistApp:
         if not self._drag:
             return
         self._kill_ghost(self._drag.get("ghost"))
-        card = self._card_widgets.get(self._drag["id"])
-        if card and card.winfo_exists():
-            card.configure(relief="solid")
+        card = self.cards.get(self._drag["id"])
+        if card is not None:
+            card.set_drag_highlight(False)
         self._drag = None
         self.save()
-        self.render()  # 표시 번호(#N)·우선순위 색 재계산
+        self._reindex()  # 표시 번호(#N)·우선순위 색만 갱신 (전체 재생성 없음)
 
     # ---- 항목 드래그 정렬 (업무 내부) ------------------------------------
     def _item_drag_start(self, event, task, item):
@@ -1040,10 +1200,12 @@ class ChecklistApp:
         items = task.get("items", [])
         drag_id = self._item_drag["id"]
         y = event.y_root
+        card = self.cards.get(task["id"])
+        blocks = card.item_blocks if card is not None else {}
         others = [it["id"] for it in items if it["id"] != drag_id]
         target = 0
         for iid in others:
-            block = self._item_blocks.get((task["id"], iid))
+            block = blocks.get(iid)
             if not block or not block.winfo_exists():
                 continue
             if y > block.winfo_rooty() + block.winfo_height() / 2:
@@ -1053,7 +1215,7 @@ class ChecklistApp:
             id_to_item = {it["id"]: it for it in items}
             task["items"] = [id_to_item[i] for i in new_order]
             for iid in new_order:
-                block = self._item_blocks.get((task["id"], iid))
+                block = blocks.get(iid)
                 if block and block.winfo_exists():
                     block.pack_forget()
                     block.pack(fill="x")
@@ -1070,9 +1232,10 @@ class ChecklistApp:
                 handle.configure(foreground="#bbb")
             except Exception:  # noqa: BLE001
                 pass
+        task = self._item_drag["task"]
         self._item_drag = None
         self.save()
-        self.render()  # 그룹(칸) 정렬을 다시 맞춤
+        self._rebuild_card(task)  # 그룹(칸) 정렬을 다시 맞춤 (이 카드만)
 
 
 def main():
