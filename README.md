@@ -69,10 +69,13 @@ python checklist.py
 
 | 파일 | 설명 |
 | --- | --- |
-| `checklist.py` | 프로그램 본체 (GUI · 데이터 · 프리셋 전부 포함, 단일 파일) |
+| `core.py` | **공통 로직** — 상수 · 데이터 모델 · 영속성(load/save) · 마이그레이션 · 진행률 집계. **GUI 라이브러리를 일절 import하지 않음** (화면을 다른 스택으로 다시 만들어도 그대로 재사용 가능) |
+| `checklist.py` | **UI 레이어** — tkinter 위젯 · 렌더링 · 이벤트 · 드래그 정렬. `core`에서 import해 사용 |
 | `checklist_data.json` | 업무·항목 저장 파일 (실행 시 자동 생성) |
 
-프리셋(공통/카테고리별 항목)은 **데이터 파일(`checklist_data.json`)의 `presets` 블록**에 저장되며, **[⚙ 설정 → 프리셋 관리]**에서 편집합니다. `checklist.py` 상단의 `DEFAULT_COMMON_ITEMS` · `DEFAULT_CATEGORY_TEMPLATES` 상수는 **최초 실행 시 시드값**이자 [프리셋 초기화] 시 되돌릴 기본값입니다.
+> 코드는 **"UI와 무관한 공통 로직(`core.py`)"** 과 **"화면(`checklist.py`)"** 으로 분리되어 있습니다. 데이터·저장·마이그레이션은 `core.py`에 모여 있어, 향후 화면을 다른 방식으로 다시 만들더라도 핵심 로직은 재사용할 수 있습니다.
+
+프리셋(공통/카테고리별 항목)은 **데이터 파일(`checklist_data.json`)의 `presets` 블록**에 저장되며, **[⚙ 설정 → 프리셋 관리]**에서 편집합니다. `core.py`의 `DEFAULT_COMMON_ITEMS` · `DEFAULT_CATEGORY_TEMPLATES` 상수는 **최초 실행 시 시드값**이자 [프리셋 초기화] 시 되돌릴 기본값입니다.
 
 ---
 

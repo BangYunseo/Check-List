@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Work CheckList — 업무 체크리스트 프로그램
+Work CheckList — 업무 체크리스트 프로그램 (UI 레이어)
 - 항상 위에 떠 있는 가벼운 체크리스트 위젯 (Sticky Notes 보완용).
-- 업무는 기본적으로 '빈 체크리스트'로 시작하고, 사용자가 항목/하위 항목을
-  직접 추가하거나 [프리셋 불러오기]로 유형별(초기개발/유지보수) 기본 목록을 채운다.
-- 항목은 자유롭게 추가·삭제·드래그 정렬할 수 있다.
+- 이 파일은 화면(tkinter 위젯·이벤트·렌더링)만 담당한다. 상수·데이터 모델·
+  영속성·마이그레이션·진행률 집계 같은 'UI 와 무관한 공통 로직'은 core.py 에 있다.
+  → 화면을 다른 스택(예: 웹/HTML)으로 다시 만들어도 core.py 는 그대로 재사용 가능.
 - 순수 파이썬 표준 라이브러리(tkinter + json)만 사용. 외부 전송 없음.
 - 기준 문서: checklist_spec.md
 """
@@ -13,7 +13,6 @@ import copy
 import json
 import os
 import re
-import shutil
 import sys
 
 try:
@@ -27,342 +26,35 @@ except ImportError:  # tkinter 미설치 환경
     )
     sys.exit(1)
 
-
-# ──────────────────────────────────────────────────────────────────────────
-# 1. 프리셋 '기본값' 정의 (최초 실행 시 데이터 파일에 복사되는 시드)
-#    실제 사용되는 프리셋은 데이터 파일(presets)에 저장되며 [설정 → 프리셋 관리]
-#    에서 편집한다. 여기를 고치면 '프리셋 초기화'를 눌렀을 때의 기본값이 바뀐다.
-#    새 업무는 기본적으로 비어 있다.
-# ──────────────────────────────────────────────────────────────────────────
-
-# 공통 프리셋 — 어떤 업무든 공통으로 쓸 만한 기본 항목
-DEFAULT_COMMON_ITEMS = [
-    "요구사항 확인",
-    "프로젝트 모델 확인",
-    "주석 작성",
-    "빌드 확인",
-]
-
-# 카테고리별 {초기개발, 유지보수} 프리셋
-DEFAULT_CATEGORY_TEMPLATES = {
-    "화면개발": {
-        "초기개발": [
-            "화면 UI/UX 구현",
-            "컴포넌트 재사용 가능성 검토",
-            "입력값 유효성 검사 처리",
-            "로딩 / 빈 데이터 / 에러 상태 화면 처리",
-            "반응형 / 해상도 대응 확인",
-            "화면 QC (레이아웃·동작)",
-        ],
-        "유지보수": [
-            "변경 영향 범위 점검 (연관 화면 확인)",
-            "기존 동작 회귀 테스트",
-            "변경 전/후 화면 비교 확인",
-        ],
-    },
-    "DB작업": {
-        "초기개발": [
-            "테이블 / 컬럼 설계 확인",
-            "쿼리 작성",
-            "인덱스 / 성능 점검",
-            "트랜잭션 처리 확인",
-            "더미 데이터로 동작 검증",
-        ],
-        "유지보수": [
-            "스키마 변경 영향 범위 점검",
-            "마이그레이션 / 롤백 방안 확인",
-            "기존 쿼리 호환성 회귀 테스트",
-            "데이터 정합성 확인",
-        ],
-    },
-    "API작업": {
-        "초기개발": [
-            "엔드포인트 / 요청·응답 명세 정의",
-            "요청 파라미터 유효성 검증",
-            "인증 / 권한 처리",
-            "에러 응답 / 예외 처리",
-            "응답 포맷 확인",
-        ],
-        "유지보수": [
-            "하위 호환성(Breaking Change) 점검",
-            "연동 클라이언트 영향 범위 확인",
-            "기존 호출 회귀 테스트",
-            "변경 명세 문서 갱신",
-        ],
-    },
-    "테스트": {
-        "초기개발": [
-            "테스트 케이스 작성",
-            "정상 / 예외 / 경계값 검증",
-            "테스트 결과 기록",
-        ],
-        "유지보수": [
-            "회귀 테스트",
-            "수정 범위 재검증",
-        ],
-    },
-    "배포/운영": {
-        "초기개발": [
-            "배포 스크립트 / 절차 확인",
-            "환경 변수 / 설정 점검",
-            "롤백 방안 확인",
-        ],
-        "유지보수": [
-            "배포 영향 범위 점검",
-            "모니터링 / 로그 확인",
-        ],
-    },
-    "문서화": {
-        "초기개발": [
-            "기능 명세 / 사용법 문서 작성",
-            "주석 / 코드 정리",
-        ],
-        "유지보수": [
-            "변경 내역 문서 갱신",
-        ],
-    },
-    "버그수정": {
-        "초기개발": [
-            "재현 경로 확인",
-            "원인 분석",
-            "수정 후 재현 테스트",
-        ],
-        "유지보수": [
-            "연관 기능 회귀 테스트",
-            "재발 방지 점검",
-        ],
-    },
-    "리팩토링": {
-        "초기개발": [
-            "변경 전 동작 기준 확보",
-            "구조 / 네이밍 개선",
-            "동작 동일성 검증",
-        ],
-        "유지보수": [
-            "성능 / 가독성 비교",
-        ],
-    },
-    "기타": {
-        "초기개발": [
-            "작업 목표 / 완료 기준 정의",
-            "결과물 동작 확인",
-        ],
-        "유지보수": [
-            "변경 영향 범위 점검",
-            "기존 동작 회귀 테스트",
-        ],
-    },
-}
-
-# 카테고리 / 유형 / 상태 선택지
-DEFAULT_CATEGORY_ORDER = ["화면개발", "DB작업", "API작업", "테스트",
-                          "배포/운영", "문서화", "버그수정", "리팩토링", "기타"]
-KIND_ORDER = ["초기개발", "유지보수"]
-STATUS_ORDER = ["진행", "완료", "중단", "종료", "제외"]
-NONE_LABEL = "(없음)"  # 카테고리 드롭다운의 '선택 안 함' 항목
-GROUP_NONE_LABEL = "직접 작성"  # 항목 group="" 을 가리키는 드롭다운 표시 라벨
-
-# 태그 표시 색
-KIND_COLORS = {"초기개발": "#2f6fb0", "유지보수": "#a06a00"}
-STATUS_COLORS = {
-    "진행": "#2f6fb0", "완료": "#2d8a4e", "중단": "#b03a3a",
-    "종료": "#777777", "제외": "#999999",
-}
-# 진행률 집계에서 빼는 상태 (완료된/대상 아닌 업무)
-STATUS_DIMMED = {"종료", "제외"}
+# 공통 로직(상수·데이터 모델·영속성·진행률 집계)은 core.py 에서 가져온다.
+from core import (
+    DEFAULT_CATEGORY_ORDER, KIND_ORDER, STATUS_ORDER,
+    NONE_LABEL, GROUP_NONE_LABEL,
+    KIND_COLORS, STATUS_COLORS, STATUS_DIMMED,
+    DEFAULT_SETTINGS, FONT_SIZE_MIN, FONT_SIZE_MAX,
+    data_path, default_presets, ensure_presets, ensure_settings,
+    load_data, task_progress,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 2. 데이터 영속성 (JSON) + 마이그레이션
+# 테마 화이트리스트 — vista 기준 레이아웃을 유지하기 위해, 위치/여백이 vista와
+# 거의 같은 네이티브 테마와 깔끔한 clam 만 남긴다. classic/alt/default/winnative
+# 는 여백·요소 모양이 어긋나 보여 목록에서 제외한다. 시스템에 없는 테마는 자동
+# 으로 빠지고, 하나도 없으면 전체 목록으로 폴백한다. (어떤 ttk 테마가 실제로
+# 존재하는지는 toolkit 에 물어봐야 하므로 이 부분은 UI 레이어에 둔다.)
 # ──────────────────────────────────────────────────────────────────────────
-
-DATA_FILENAME = "checklist_data.json"
-DATA_VERSION = 3
-
-# 일반 설정 기본값 — 데이터 파일의 settings 블록 시드.
-DEFAULT_SETTINGS = {
-    "font_family": "Segoe UI",
-    "font_size": 10,
-    "theme": "vista",
-}
-# 글자 크기 허용 범위 (스핀박스).
-FONT_SIZE_MIN, FONT_SIZE_MAX = 8, 18
+ALLOWED_THEMES = ["vista", "xpnative", "clam"]
 
 
-def data_path():
-    """프로그램과 같은 폴더에 데이터 파일을 둔다."""
-    base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, DATA_FILENAME)
-
-
-def default_presets():
-    """코드 기본값에서 '편집 가능한 프리셋' 구조를 새로 만든다(깊은 복사)."""
-    return {
-        "common": list(DEFAULT_COMMON_ITEMS),
-        "category_order": list(DEFAULT_CATEGORY_ORDER),
-        "categories": copy.deepcopy(DEFAULT_CATEGORY_TEMPLATES),
-    }
-
-
-def ensure_presets(data):
-    """presets 블록을 v3 구조로 보정한다(없으면 기본값으로 시드)."""
-    presets = data.get("presets")
-    if not isinstance(presets, dict):
-        data["presets"] = default_presets()
-        return
-    presets.setdefault("common", list(DEFAULT_COMMON_ITEMS))
-    cats = presets.setdefault("categories", {})
-    # category_order 는 categories 의 키와 어긋나지 않도록 보정한다.
-    order = presets.get("category_order")
-    if not isinstance(order, list):
-        order = list(DEFAULT_CATEGORY_ORDER)
-    order = [c for c in order if c in cats]           # 사라진 카테고리 제거
-    for c in cats:                                    # 누락된 카테고리 끝에 추가
-        if c not in order:
-            order.append(c)
-    presets["category_order"] = order
-    for cat, tpl in cats.items():
-        if not isinstance(tpl, dict):
-            cats[cat] = {k: [] for k in KIND_ORDER}
-            continue
-        for k in KIND_ORDER:
-            tpl.setdefault(k, [])
-
-
-def ensure_settings(data):
-    """settings 블록을 보정한다(없으면 기본값으로 시드)."""
-    settings = data.get("settings")
-    if not isinstance(settings, dict):
-        settings = {}
-    for key, val in DEFAULT_SETTINGS.items():
-        settings.setdefault(key, val)
+def available_themes():
+    """화이트리스트 중 이 시스템에 실제 존재하는 테마만 순서대로 반환한다."""
     try:
-        size = int(settings.get("font_size", DEFAULT_SETTINGS["font_size"]))
-    except (TypeError, ValueError):
-        size = DEFAULT_SETTINGS["font_size"]
-    settings["font_size"] = max(FONT_SIZE_MIN, min(FONT_SIZE_MAX, size))
-    data["settings"] = settings
-
-
-def default_data():
-    return {"version": DATA_VERSION, "next_id": 1, "always_on_top": True,
-            "geometry": None, "settings": dict(DEFAULT_SETTINGS),
-            "presets": default_presets(), "tasks": []}
-
-
-def _legacy_auto_texts(categories):
-    """v1 데이터 복원용: 옛 카테고리에서 공통+개발+수정 항목 텍스트를 순서대로."""
-    texts = []
-    seen = set()
-    for t in DEFAULT_COMMON_ITEMS:
-        if t not in seen:
-            texts.append(t)
-            seen.add(t)
-    for cat in DEFAULT_CATEGORY_ORDER:
-        if cat not in categories:
-            continue
-        tpl = DEFAULT_CATEGORY_TEMPLATES.get(cat, {})
-        for kind in KIND_ORDER:
-            for t in tpl.get(kind, []):
-                if t not in seen:
-                    texts.append(t)
-                    seen.add(t)
-    return texts
-
-
-def ensure_task_fields(task, index=0):
-    """업무 한 건의 필드를 v2 구조로 보정한다(필요 시 v1 → v2 마이그레이션)."""
-    task.setdefault("title", task.pop("subtitle", ""))  # subtitle → title
-    task.setdefault("kind", "")
-    task.setdefault("categories", [])
-    task.setdefault("status", "진행")
-    task.setdefault("collapsed", False)
-    # 우선순위(1/2/3): 기존 데이터는 순서대로 1,2,3 … 4번째부터는 고정 3.
-    task.setdefault("priority", min(index + 1, 3))
-
-    if "items" not in task:
-        # v1: checks(자동) + manual(수동)을 실제 항목으로 변환(데이터 보존).
-        checks = task.pop("checks", {}) or {}
-        manual = task.pop("manual", []) or []
-        items = []
-        nid = 1
-
-        def add(text, checked):
-            nonlocal nid
-            items.append({"id": nid, "text": text, "checked": bool(checked),
-                          "group": "", "subitems": []})
-            nid += 1
-
-        # 기본 정책은 '빈 체크리스트'. 따라서 옛 자동 항목 중 실제로 체크돼
-        # 있던 것(=사용자의 진행 상태)과 수동 항목만 보존하고, 체크 안 된
-        # 템플릿 항목은 버린다. 필요하면 [프리셋 불러오기]로 다시 채운다.
-        checked_texts = {key.split("::", 1)[1]
-                         for key, val in checks.items() if val and "::" in key}
-        for text in _legacy_auto_texts(task.get("categories", [])):
-            if text in checked_texts:
-                add(text, True)
-        for m in manual:
-            add(m.get("text", ""), m.get("checked", False))
-
-        task["items"] = items
-        task["next_item_id"] = nid
-    else:
-        # v2: 항목 구조 보정
-        nid = task.get("next_item_id", 1)
-        for it in task["items"]:
-            it.setdefault("checked", False)
-            it.setdefault("group", "")
-            it.setdefault("subitems", [])
-            if "id" not in it:
-                it["id"] = nid
-                nid += 1
-            for sub in it["subitems"]:
-                sub.setdefault("checked", False)
-                if "id" not in sub:
-                    sub["id"] = nid
-                    nid += 1
-        task["next_item_id"] = max(nid, task.get("next_item_id", 1))
-
-
-def load_data():
-    """파일 없으면 빈 상태. 손상 시 백업 후 빈 상태로 복구. v1은 v2로 변환."""
-    path = data_path()
-    if not os.path.exists(path):
-        return default_data(), None
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:   # UTF-8 고정
-            data = json.load(f)
-        if not isinstance(data, dict) or "tasks" not in data:
-            raise ValueError("형식이 올바르지 않습니다.")
-        data.setdefault("next_id", _infer_next_id(data))
-        data.setdefault("always_on_top", True)
-        data.setdefault("geometry", None)
-        data.setdefault("tasks", [])
-        ensure_settings(data)   # v2 이하 → settings 블록 시드
-        ensure_presets(data)    # v2 이하 → presets 블록 시드(코드 기본값 복사)
-        for idx, task in enumerate(data["tasks"]):
-            ensure_task_fields(task, idx)
-        data["version"] = DATA_VERSION
-        return data, None
-    except Exception as e:  # noqa: BLE001  (손상/파싱 실패 전부 복구 대상)
-        backup = None
-        try:
-            backup = path + ".corrupt.bak"
-            shutil.copy2(path, backup)
-        except Exception:  # noqa: BLE001
-            backup = None
-        return default_data(), ("load_corrupt", str(e), backup)
-
-
-def _infer_next_id(data):
-    max_id = 0
-    for t in data.get("tasks", []):
-        try:
-            max_id = max(max_id, int(t.get("id", 0)))
-        except (TypeError, ValueError):
-            pass
-    return max_id + 1
+        present = set(ttk.Style().theme_names())
+    except Exception:  # noqa: BLE001
+        return list(ALLOWED_THEMES)
+    allowed = [t for t in ALLOWED_THEMES if t in present]
+    return allowed or sorted(present)   # 화이트리스트가 다 없으면 전체로 폴백
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -509,6 +201,8 @@ class TaskCard:
         self._snapshot = None      # 편집 진입 시 항목 상태 사본(취소 시 복구용)
         self._edit_new = None      # rebuild 후 인라인 입력할 대상 ("item"/"sub", id)
         self._item_cbs = {}        # {("item"|"sub", id): Checkbutton} — 인라인 편집용
+        self._sub_rows = {}        # {sub_id: srow Frame} — 세부 항목 부분 삭제용
+        self._headers_shown = False  # 현재 카드에 그룹(카테고리) 헤더가 떠 있는지
         self._last_title_fit = None  # (폭, 제목) 캐시 — 같은 값이면 재계산 생략
 
     # ---- 생성 / 재생성 ----------------------------------------------------
@@ -548,6 +242,8 @@ class TaskCard:
         self.position = position
         app, task = self.app, self.task
         self._item_cbs = {}
+        self._sub_rows = {}
+        self._headers_shown = False
         self._last_title_fit = None   # 새 제목 라벨이므로 캐시 초기화
 
         header = ttk.Frame(self.frame)
@@ -619,7 +315,7 @@ class TaskCard:
                               command=lambda val=s: app.set_status(task, val))
         smb["menu"] = smenu
         smb.pack(side="right", padx=(0, 6))
-        done, total = app.task_progress(task)
+        done, total = task_progress(task)
         self.prog_lbl = ttk.Label(header, text="{}/{}".format(done, total),
                                   foreground="#555")
         self.prog_lbl.pack(side="right", padx=(0, 8))
@@ -670,6 +366,7 @@ class TaskCard:
                 present.append(g)
         present.sort(key=group_rank)
         multi = len(present) > 1
+        self._headers_shown = multi   # 부분 삭제 시 헤더 표시 변화 판단용
 
         for g in present:
             if multi:
@@ -768,6 +465,7 @@ class TaskCard:
         for sub in item.get("subitems", []):
             srow = ttk.Frame(block)
             srow.pack(fill="x", padx=(28, 0))
+            self._sub_rows[sub["id"]] = srow
             svar = tk.BooleanVar(value=bool(sub.get("checked")))
             scb = ttk.Checkbutton(srow, text=sub["text"], variable=svar, state=st,
                                   command=lambda s=sub, v=svar: app.toggle_subitem(s, v))
@@ -841,16 +539,47 @@ class TaskCard:
         self.app.root.after_idle(self.rebuild)
 
     def remove_item(self, item):
+        iid = item["id"]
         self.task["items"] = [it for it in self.task.get("items", [])
                               if it is not item]
         self.app.save()
-        self.rebuild()
+        # 카드 전체를 다시 그리지 않고 해당 항목 블록만 지운다(깜빡임·부하 감소).
+        # 단, 그룹 헤더가 떠 있을 때 그 그룹이 비거나(헤더 고아), 항목이 전부
+        # 사라져 '항목 없음' 안내가 필요한 경우엔 안전하게 이 카드만 rebuild 한다.
+        items = self.task.get("items", [])
+        group = item.get("group", "")
+        remaining_groups = {it.get("group", "") for it in items}
+        needs_rebuild = (
+            not items or                               # 전체가 비었다 → 안내 문구
+            (self._headers_shown and
+             (group not in remaining_groups or         # 이 그룹이 사라짐 → 헤더 고아
+              len(remaining_groups) <= 1))             # 그룹 1개로 줄어 헤더 불필요
+        )
+        if needs_rebuild:
+            self.rebuild()
+        else:
+            self._item_cbs.pop(("item", iid), None)
+            for s in item.get("subitems", []):
+                self._item_cbs.pop(("sub", s["id"]), None)
+                self._sub_rows.pop(s["id"], None)
+            block = self.item_blocks.pop(iid, None)
+            if block is not None and block.winfo_exists():
+                block.destroy()
+            self.update_progress()   # rebuild 안 했으니 n/m 라벨은 직접 갱신
         self.app._refresh_overall()
 
     def remove_subitem(self, item, sub):
+        sid = sub["id"]
         item["subitems"] = [s for s in item.get("subitems", []) if s is not sub]
         self.app.save()
-        self.rebuild()
+        # 세부 항목 줄(srow)만 직접 지운다 — 카드 재생성 없음.
+        self._item_cbs.pop(("sub", sid), None)
+        srow = self._sub_rows.pop(sid, None)
+        if srow is not None and srow.winfo_exists():
+            srow.destroy()
+            self.update_progress()   # rebuild 안 했으니 n/m 라벨은 직접 갱신
+        else:
+            self.rebuild()   # 추적 정보가 없으면(예외) 안전하게 폴백
         self.app._refresh_overall()
 
     # ---- 새 항목 제목 인라인 입력 ----------------------------------------
@@ -959,7 +688,7 @@ class TaskCard:
 
     def update_progress(self):
         if self.prog_lbl is not None and self.prog_lbl.winfo_exists():
-            done, total = self.app.task_progress(self.task)
+            done, total = task_progress(self.task)
             self.prog_lbl.config(text="{}/{}".format(done, total))
 
     def set_priority(self, value):
@@ -993,19 +722,21 @@ class ChecklistApp:
         self._max_h = self.root.winfo_screenheight()
         self._apply_size_limits()
 
-        self.data, load_warn = load_data()
+        themes = available_themes()
+        self.data, load_warn = load_data(valid_themes=themes)
         self.save_error_shown = False
         # 글꼴/글자 크기/테마는 설정(settings)에서 읽어 적용한다. 제목 라벨용
         # 폰트(카드 공유)는 폭이 좁을 때 제목을 '…'로 줄이는 데도 쓰인다.
-        ensure_settings(self.data)
+        ensure_settings(self.data, valid_themes=themes)
         ensure_presets(self.data)
         s = self.data["settings"]
         self.font_family = s.get("font_family", DEFAULT_SETTINGS["font_family"])
         self.font_size = int(s.get("font_size", DEFAULT_SETTINGS["font_size"]))
         self.title_font = tkfont.Font(
             family=self.font_family, size=self.font_size, weight="bold")
-        self._apply_fonts()
+        # 테마 먼저 적용한 뒤 글꼴을 박는다(테마가 스타일 글꼴을 초기화하므로 순서 중요).
         self._apply_theme(s.get("theme", DEFAULT_SETTINGS["theme"]))
+        self._apply_fonts()
         self._geo_after = None       # 창 크기/위치 저장 디바운스 핸들
         self._drag = None            # 업무(카드) 드래그 상태
         self._item_drag = None       # 항목 드래그 상태
@@ -1063,11 +794,27 @@ class ChecklistApp:
         return (self.font_family, size, "bold") if bold else (self.font_family, size)
 
     def _apply_fonts(self):
-        """Tk 기본 명명 폰트를 설정값으로 바꿔 ttk 위젯 전반에 글꼴을 적용한다."""
+        """글꼴을 ttk 위젯 전반에 적용한다.
+        ① Tk 기본 명명 폰트(TkDefaultFont 등)와 ② ttk 스타일의 기준('.')
+        둘 다에 글꼴을 박는다. 명명 폰트만 바꾸면 일부 네이티브 테마(vista 등)는
+        스타일에 박힌 글꼴을 우선시해 변경이 안 먹는다 → ②로 확실히 적용한다."""
         for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
             try:
                 tkfont.nametofont(name).configure(
                     family=self.font_family, size=self.font_size)
+            except Exception:  # noqa: BLE001
+                pass
+        # ttk: 기준('.')만 바꾸면 vista 같은 네이티브 테마는 개별 스타일에 박힌
+        # 글꼴을 우선시해 변경이 안 먹는다. 그래서 실제로 쓰는 위젯 스타일마다
+        # 직접 글꼴을 박는다(이게 항목 체크박스 등 본문 글꼴을 실제로 바꾼다).
+        font = (self.font_family, self.font_size)
+        style = ttk.Style()
+        for st in (".", "TLabel", "TButton", "TCheckbutton", "TRadiobutton",
+                   "TMenubutton", "TEntry", "TCombobox", "TSpinbox", "Toolbutton",
+                   "TNotebook.Tab", "TLabelframe.Label", "Treeview",
+                   "Treeview.Heading"):
+            try:
+                style.configure(st, font=font)
             except Exception:  # noqa: BLE001
                 pass
         try:
@@ -1091,8 +838,9 @@ class ChecklistApp:
         if theme is not None:
             s["theme"] = theme
             self._apply_theme(theme)
-        if font_family is not None or font_size is not None:
-            self._apply_fonts()
+        # 테마를 바꾸면 ttk 스타일의 글꼴이 그 테마 기본값으로 초기화되므로,
+        # 글꼴/크기 변경이든 테마 변경이든 항상 글꼴을 다시 박아 준다.
+        self._apply_fonts()
         self.save()
         self.render()   # 새 글꼴/테마로 카드(배지 포함)를 다시 그린다.
 
@@ -1149,7 +897,7 @@ class ChecklistApp:
                    command=self.open_settings).pack(side="right", padx=(0, 6))
         self.overall_var = tk.StringVar(value="전체 진행률  0/0  (0%)")
         ttk.Label(toprow, textvariable=self.overall_var,
-                  font=("Segoe UI", 9)).pack(side="left")
+                  font=self.card_font(-1)).pack(side="left")
 
         # 진행 바: 글자줄 아래, 전체 폭.
         self.overall_bar = ttk.Progressbar(overall, maximum=100)
@@ -1198,6 +946,21 @@ class ChecklistApp:
             60, lambda: self.canvas.itemconfigure(self.body_window, width=w))
 
     def _on_mousewheel(self, event):
+        # bind_all 이라 어떤 위젯 위에서 굴려도 호출된다. 게다가 Windows는 휠
+        # 이벤트를 '포인터 아래'가 아니라 '포커스를 가진 창'으로 보내기도 해서
+        # event.widget 만으로는 판단이 빗나간다. 그래서 포인터의 실제 화면
+        # 좌표로 그 아래 위젯을 직접 찾고, 그게 메인 창(self.root)에 속할 때만
+        # 메인 캔버스를 스크롤한다. 설정 등 다른 창(스핀박스·콤보·드롭다운) 위에
+        # 있으면 그 창이 휠을 처리하도록 메인 스크롤은 건너뛴다.
+        try:
+            w = self.root.winfo_containing(event.x_root, event.y_root)
+        except Exception:  # noqa: BLE001
+            w = event.widget
+        try:
+            if w is None or w.winfo_toplevel() is not self.root:
+                return
+        except Exception:  # noqa: BLE001
+            return
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     # ---- 항상 위 ----------------------------------------------------------
@@ -1369,7 +1132,7 @@ class ChecklistApp:
         header.update_idletasks()
         x, y, h = label.winfo_x(), label.winfo_y(), label.winfo_height()
 
-        entry = ttk.Entry(header, width=30, font=("Segoe UI", 10, "bold"))
+        entry = ttk.Entry(header, width=30, font=self.card_font(bold=True))
         entry.insert(0, task.get("title", ""))
         entry.select_range(0, "end")
         entry.place(x=x, y=y, height=h)
@@ -1467,23 +1230,6 @@ class ChecklistApp:
         self._refresh_overall()
 
     # ---- 진행률 -----------------------------------------------------------
-    @staticmethod
-    def task_progress(task):
-        done = total = 0
-        for it in task.get("items", []):
-            total += 1
-            if it.get("checked"):
-                done += 1
-            for sub in it.get("subitems", []):
-                total += 1
-                if sub.get("checked"):
-                    done += 1
-        # '완료' 업무는 개별 체크 여부와 무관하게 전부 완료로 집계한다
-        # (수동으로 다 체크할 필요 없음). 체크 상태 자체는 보존하므로
-        # 상태를 다시 '진행' 등으로 되돌리면 원래 진행률로 복귀한다.
-        if task.get("status") == "완료":
-            return total, total
-        return done, total
 
     def _refresh_progress(self):
         for card in self.cards.values():
@@ -1496,7 +1242,7 @@ class ChecklistApp:
         for task in self.data["tasks"]:
             if task.get("status") in STATUS_DIMMED:
                 continue
-            done, total = self.task_progress(task)
+            done, total = task_progress(task)
             total_done += done
             total_all += total
         pct = int(round(total_done / total_all * 100)) if total_all else 0
@@ -1548,7 +1294,7 @@ class ChecklistApp:
         except Exception:  # noqa: BLE001
             pass
         tk.Label(g, text=text, bg=color, fg="white", padx=8, pady=3,
-                 font=("Segoe UI", 9, "bold")).pack()
+                 font=self.card_font(-1, bold=True)).pack()
         return g
 
     def _move_ghost(self, ghost, event):
@@ -1680,6 +1426,198 @@ class ChecklistApp:
 COMMON_GROUP = "공통"   # 프리셋 관리 좌측 목록에서 '공통'을 가리키는 예약 이름
 
 
+class FontPickerButton(ttk.Frame):
+    """글꼴 선택 위젯 — 펼치면 각 글꼴 이름이 '그 글꼴 모양'으로 미리보기된다.
+    ttk.Combobox 는 목록 항목마다 글꼴을 다르게 줄 수 없어, 항목을 Label 로 직접
+    그리는 커스텀 드롭다운으로 만든다. '@' 로 시작하는 세로쓰기 글꼴은 제외한다."""
+
+    PREVIEW_SIZE = 11      # 목록·버튼의 미리보기 글자 크기(설정 글자 크기와 무관)
+    MAX_ROWS = 14          # 드롭다운에 한 번에 보일 최대 줄 수(나머지는 스크롤)
+
+    def __init__(self, parent, families, initial, on_select, **kw):
+        super().__init__(parent, **kw)
+        # '@' 세로쓰기 글꼴 제외 + 중복 제거 + 이름순 정렬
+        self.families = sorted({f for f in families if not f.startswith("@")})
+        self.on_select = on_select
+        self.value = initial
+        self.popup = None
+
+        self.btn = tk.Button(self, anchor="w", relief="groove", padx=6, width=24,
+                             takefocus=0, command=self._toggle)
+        self.btn.pack(side="left", fill="x", expand=True)
+        tk.Button(self, text="▾", width=2, relief="groove", takefocus=0,
+                  command=self._toggle).pack(side="left", padx=(2, 0))
+        self._refresh_button()
+
+    # ---- 외부 인터페이스 -------------------------------------------------
+    def get(self):
+        return self.value
+
+    def set(self, family):
+        self.value = family
+        self._refresh_button()
+
+    # ---- 버튼 표시 -------------------------------------------------------
+    def _refresh_button(self):
+        self.btn.config(text=self.value or "(글꼴 선택)",
+                        font=(self.value, self.PREVIEW_SIZE) if self.value else None)
+
+    # ---- 드롭다운 열고/닫기 ----------------------------------------------
+    def _toggle(self):
+        if self.popup is not None and self.popup.winfo_exists():
+            self._close()
+        else:
+            self._open()
+
+    def _close(self):
+        self._cancel_previews()
+        if self.popup is not None and self.popup.winfo_exists():
+            self.popup.destroy()
+        self.popup = None
+
+    def _open(self):
+        self.update_idletasks()
+        pop = tk.Toplevel(self)
+        pop.overrideredirect(True)            # 제목줄 없는 떠있는 목록
+        try:
+            pop.attributes("-topmost", True)
+        except Exception:  # noqa: BLE001
+            pass
+        self.popup = pop
+
+        # 검색칸 — 글꼴이 많아(수백 개) 빠르게 찾도록.
+        self.filter_var = tk.StringVar()
+        ent = ttk.Entry(pop, textvariable=self.filter_var)
+        ent.pack(fill="x", padx=2, pady=2)
+        ent.bind("<KeyRelease>", lambda e: self._populate())
+        ent.bind("<Escape>", lambda e: self._close())
+
+        # 목록은 위젯 수백 개 대신 'Text 한 개 + 줄별 글꼴 태그'로 그린다.
+        # (Label 수백 개를 만들면 매우 느림 — Text 는 위젯 1개라 즉시 뜬다.)
+        body = ttk.Frame(pop)
+        body.pack(fill="both", expand=True)
+        vsb = ttk.Scrollbar(body, orient="vertical")
+        self._text = tk.Text(body, wrap="none", cursor="arrow", spacing1=1,
+                             spacing3=1, padx=6, highlightthickness=0, bd=0,
+                             yscrollcommand=vsb.set)
+        vsb.configure(command=self._text.yview)
+        vsb.pack(side="right", fill="y")
+        self._text.pack(side="left", fill="both", expand=True)
+        self._text.tag_configure("sel_fam", background="#cde6ff")
+        self._text.tag_configure("hover", background="#eef4fb")
+        # 줄 하나를 클릭하면 그 줄의 글꼴 선택. 이동 시 그 줄만 강조.
+        self._text.bind("<Button-1>", self._on_text_click)
+        self._text.bind("<Motion>", self._on_text_motion)
+        self._text.bind("<Leave>",
+                        lambda e: self._text.tag_remove("hover", "1.0", "end"))
+        self._text.bind("<MouseWheel>", self._on_wheel)
+        self._shown = []   # 현재 표시 중인 글꼴(줄 번호 → 글꼴 이름)
+
+        # 크기/위치: 버튼 바로 아래, 화면 안으로 보정.
+        row_h = self.PREVIEW_SIZE + 12
+        w = max(self.winfo_width(), 240)
+        h = 30 + row_h * self.MAX_ROWS
+        x = self.winfo_rootx()
+        y = self.btn.winfo_rooty() + self.btn.winfo_height()
+        sw, sh = pop.winfo_screenwidth(), pop.winfo_screenheight()
+        x = max(0, min(x, sw - w))
+        if y + h > sh:                         # 아래로 넘치면 버튼 위로
+            y = max(0, self.btn.winfo_rooty() - h)
+        pop.geometry("{}x{}+{}+{}".format(w, h, x, y))
+
+        self._populate()
+        ent.focus_set()
+        # 포커스가 팝업 밖으로 나가면 닫는다(안에서 이동한 거면 유지).
+        pop.bind("<FocusOut>", self._on_focus_out)
+
+    def _on_wheel(self, event):
+        self._text.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    def _line_at(self, event):
+        """클릭/이동 좌표가 가리키는 줄 번호(1부터). 표시 목록 범위를 벗어나면 0."""
+        idx = self._text.index("@{},{}".format(event.x, event.y))
+        line = int(idx.split(".")[0])
+        return line if 1 <= line <= len(self._shown) else 0
+
+    def _on_text_click(self, event):
+        line = self._line_at(event)
+        if line:
+            self._choose(self._shown[line - 1])
+        return "break"
+
+    def _on_text_motion(self, event):
+        self._text.tag_remove("hover", "1.0", "end")
+        line = self._line_at(event)
+        if line:
+            self._text.tag_add("hover", "{}.0".format(line),
+                               "{}.end".format(line))
+
+    def _on_focus_out(self, event):
+        # 포커스 이동이 끝난 뒤 판정(안쪽 위젯 간 이동 중 잠깐의 FocusOut 무시).
+        self.after(1, self._check_focus)
+
+    def _check_focus(self):
+        pop = self.popup
+        if pop is None or not pop.winfo_exists():
+            return
+        f = pop.focus_get()
+        if f is None or not str(f).startswith(str(pop)):
+            self._close()
+
+    def _populate(self):
+        self._cancel_previews()
+        needle = (self.filter_var.get() or "").strip().lower()
+        self._shown = [f for f in self.families if needle in f.lower()] if needle \
+            else list(self.families)
+        txt = self._text
+        txt.configure(state="normal")
+        txt.delete("1.0", "end")
+        # ① 우선 '기본 글꼴'로 이름을 한 번에 넣어 즉시 띄운다(빠름).
+        txt.insert("1.0", "\n".join(self._shown))
+        if self.value in self._shown:        # 현재 글꼴 줄 강조 + 그리로 스크롤
+            ln = self._shown.index(self.value) + 1
+            txt.tag_add("sel_fam", "{}.0".format(ln), "{}.end".format(ln))
+            txt.see("{}.0".format(ln))
+        else:
+            txt.yview_moveto(0)
+        txt.configure(state="disabled")
+        # ② 각 줄의 미리보기 글꼴은 무거우므로(글꼴마다 OS 로드) 조금씩 나눠 입힌다.
+        self._apply_previews(0)
+
+    def _cancel_previews(self):
+        job = getattr(self, "_preview_job", None)
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except Exception:  # noqa: BLE001
+                pass
+        self._preview_job = None
+
+    def _apply_previews(self, start):
+        """줄별 미리보기 글꼴을 CHUNK 줄씩 적용하고 다음 묶음을 예약(논블로킹)."""
+        pop = self.popup
+        if pop is None or not pop.winfo_exists():
+            return
+        CHUNK = 24
+        txt = self._text
+        end = min(start + CHUNK, len(self._shown))
+        for i in range(start, end):
+            fam = self._shown[i]
+            tag = "f{}".format(i + 1)
+            txt.tag_configure(tag, font=(fam, self.PREVIEW_SIZE))
+            txt.tag_add(tag, "{}.0".format(i + 1), "{}.end".format(i + 1))
+        if end < len(self._shown):
+            self._preview_job = self.after(1, lambda: self._apply_previews(end))
+        else:
+            self._preview_job = None
+
+    def _choose(self, family):
+        self._close()
+        self.set(family)
+        self.on_select(family)
+
+
 class SettingsDialog(tk.Toplevel):
     def __init__(self, app):
         super().__init__(app.root)
@@ -1734,7 +1672,17 @@ class SettingsDialog(tk.Toplevel):
     def _change_theme(self):
         """테마를 적용한 뒤 폼 크기가 따라 커지지 않도록 고정 크기를 복원한다."""
         self.app.apply_settings(theme=self.theme_var.get())
+        self._style_preset_buttons()   # 테마 변경 시 사라질 수 있어 다시 적용
         self._reassert_size()
+
+    def _style_preset_buttons(self):
+        """프리셋 관리 버튼(추가·수정·삭제·이름 등)의 글꼴만 '한 단계' 작게 둔다.
+        너무 줄이면 읽기 어려워 -1 까지만. 버튼은 width 를 지정하지 않아 글자가
+        잘리지 않고 내용에 맞게 자동으로 넓어진다."""
+        size = max(8, self.app.font_size - 1)
+        # 글꼴만 한 단계 작게. (테마에 따라 버튼 최소 너비는 OS 기본값을 따른다.)
+        ttk.Style(self).configure(
+            "Preset.TButton", font=(self.app.font_family, size))
 
     def _center_on(self, master):
         self.update_idletasks()
@@ -1759,13 +1707,12 @@ class SettingsDialog(tk.Toplevel):
                         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         ttk.Label(parent, text="글꼴").grid(row=1, column=0, sticky="w", pady=4)
-        self.font_var = tk.StringVar(value=app.font_family)
-        families = sorted(set(tkfont.families()))
-        fcb = ttk.Combobox(parent, textvariable=self.font_var, values=families,
-                           width=26, state="readonly")
-        fcb.grid(row=1, column=1, sticky="w", pady=4)
-        fcb.bind("<<ComboboxSelected>>",
-                 lambda e: app.apply_settings(font_family=self.font_var.get()))
+        # 글꼴 목록은 각 이름이 '그 글꼴 모양'으로 보이는 커스텀 피커로 고른다
+        # ('@' 세로쓰기 글꼴은 FontPickerButton 내부에서 제외).
+        self.font_picker = FontPickerButton(
+            parent, tkfont.families(), app.font_family,
+            on_select=lambda fam: app.apply_settings(font_family=fam))
+        self.font_picker.grid(row=1, column=1, sticky="we", pady=4)
 
         ttk.Label(parent, text="글자 크기").grid(row=2, column=0, sticky="w", pady=4)
         self.size_var = tk.IntVar(value=app.font_size)
@@ -1774,11 +1721,18 @@ class SettingsDialog(tk.Toplevel):
         sp.grid(row=2, column=1, sticky="w", pady=4)
         sp.bind("<Return>", lambda e: self._on_size())
         sp.bind("<FocusOut>", lambda e: self._on_size())
+        # 스핀박스 위에서 휠을 돌리면 글자 크기를 1씩 조절한다(메인 목록 스크롤과
+        # 분리). "break" 로 상위(bind_all) 핸들러까지 가지 않게 막는다.
+        sp.bind("<MouseWheel>", self._on_size_wheel)
 
         ttk.Label(parent, text="테마").grid(row=3, column=0, sticky="w", pady=4)
-        self.theme_var = tk.StringVar(
-            value=app.settings().get("theme", DEFAULT_SETTINGS["theme"]))
-        themes = list(ttk.Style().theme_names())
+        # vista 기준 레이아웃 유지를 위해 vista류 테마만 노출(ALLOWED_THEMES).
+        themes = available_themes()
+        cur_theme = app.settings().get("theme", DEFAULT_SETTINGS["theme"])
+        # 저장된 테마가 목록에 없으면(예: 옛 설정의 alt) 첫 번째로 보정해 둔다.
+        if cur_theme not in themes and themes:
+            cur_theme = themes[0]
+        self.theme_var = tk.StringVar(value=cur_theme)
         tcb = ttk.Combobox(parent, textvariable=self.theme_var, values=themes,
                            width=26, state="readonly")
         tcb.grid(row=3, column=1, sticky="w", pady=4)
@@ -1796,6 +1750,20 @@ class SettingsDialog(tk.Toplevel):
         ttk.Label(parent, foreground="#888",
                   text="데이터 파일: {}".format(os.path.basename(data_path()))
                   ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+    def _on_size_wheel(self, event):
+        """스핀박스 위 휠로 글자 크기를 1씩 조절(메인 목록 스크롤과 분리).
+        "break" 로 상위(bind_all) 핸들러까지 전파되지 않게 막는다."""
+        try:
+            cur = int(self.size_var.get())
+        except (tk.TclError, ValueError):
+            cur = self.app.font_size
+        step = 1 if event.delta > 0 else -1
+        new = max(FONT_SIZE_MIN, min(FONT_SIZE_MAX, cur + step))
+        if new != cur:
+            self.size_var.set(new)
+            self._on_size()
+        return "break"
 
     def _on_size(self):
         try:
@@ -1820,22 +1788,26 @@ class SettingsDialog(tk.Toplevel):
         app = self.app
         parent.columnconfigure(1, weight=1)
         parent.rowconfigure(0, weight=1)
+        # 프리셋 관리 버튼(추가·수정·삭제·이름 등)은 글꼴만 조금 작게.
+        self._style_preset_buttons()
 
         # 왼쪽: 그룹(공통 + 카테고리) 목록
         left = ttk.Frame(parent)
         left.grid(row=0, column=0, sticky="ns", padx=(0, 10))
         ttk.Label(left, text="그룹", font=app.card_font(0, bold=True)).pack(anchor="w")
         self.group_list = tk.Listbox(left, height=12, width=14, exportselection=False)
-        self.group_list.pack(fill="y", expand=True)
+        # 목록을 좌우로도 채워 버튼 줄 너비에 맞춘다(목록이 버튼보다 좁아 보이지 않게).
+        self.group_list.pack(fill="both", expand=True)
         self.group_list.bind("<<ListboxSelect>>", self._on_group_select)
         gbtns = ttk.Frame(left)
         gbtns.pack(fill="x", pady=(4, 0))
-        ttk.Button(gbtns, text="+추가", width=5, command=self._add_category
-                   ).pack(side="left")
-        ttk.Button(gbtns, text="이름", width=4, command=self._rename_category
-                   ).pack(side="left", padx=(2, 0))
-        ttk.Button(gbtns, text="삭제", width=4, command=self._delete_category
-                   ).pack(side="left", padx=(2, 0))
+        # width 미지정 → 글자가 잘리지 않게 내용에 맞춰 자동 크기. 글꼴만 살짝 작게.
+        ttk.Button(gbtns, text="추가", style="Preset.TButton",
+                   command=self._add_category).pack(side="left")
+        ttk.Button(gbtns, text="이름", style="Preset.TButton",
+                   command=self._rename_category).pack(side="left", padx=(2, 0))
+        ttk.Button(gbtns, text="삭제", style="Preset.TButton",
+                   command=self._delete_category).pack(side="left", padx=(2, 0))
 
         # 오른쪽: 유형 선택 + 항목 목록 + 항목 버튼
         right = ttk.Frame(parent)
@@ -1858,22 +1830,23 @@ class SettingsDialog(tk.Toplevel):
         self.items_hint = ttk.Label(right, foreground="#888", text="")
         self.items_hint.grid(row=1, column=0, sticky="w", pady=(2, 2))
 
-        self.item_list = tk.Listbox(right, height=12, exportselection=False)
+        self.item_list = tk.Listbox(right, height=12, width=22, exportselection=False)
         self.item_list.grid(row=2, column=0, sticky="nsew")
         self.item_list.bind("<Double-Button-1>", lambda e: self._edit_item())
 
         ibtns = ttk.Frame(right)
         ibtns.grid(row=3, column=0, sticky="w", pady=(4, 0))
-        ttk.Button(ibtns, text="추가", width=5, command=self._add_item
-                   ).pack(side="left")
-        ttk.Button(ibtns, text="수정", width=5, command=self._edit_item
-                   ).pack(side="left", padx=(2, 0))
-        ttk.Button(ibtns, text="삭제", width=5, command=self._delete_item
-                   ).pack(side="left", padx=(2, 0))
-        ttk.Button(ibtns, text="▲", width=3, command=lambda: self._move_item(-1)
-                   ).pack(side="left", padx=(8, 0))
-        ttk.Button(ibtns, text="▼", width=3, command=lambda: self._move_item(1)
-                   ).pack(side="left", padx=(2, 0))
+        # width 미지정 → 글자가 잘리지 않게 자동 크기. 화살표만 살짝 폭 지정.
+        ttk.Button(ibtns, text="추가", style="Preset.TButton",
+                   command=self._add_item).pack(side="left")
+        ttk.Button(ibtns, text="수정", style="Preset.TButton",
+                   command=self._edit_item).pack(side="left", padx=(2, 0))
+        ttk.Button(ibtns, text="삭제", style="Preset.TButton",
+                   command=self._delete_item).pack(side="left", padx=(2, 0))
+        ttk.Button(ibtns, text="▲", width=2, style="Preset.TButton",
+                   command=lambda: self._move_item(-1)).pack(side="left", padx=(6, 0))
+        ttk.Button(ibtns, text="▼", width=2, style="Preset.TButton",
+                   command=lambda: self._move_item(1)).pack(side="left", padx=(2, 0))
 
         self._reload_groups()
 
