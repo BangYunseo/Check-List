@@ -63,18 +63,30 @@ def available_themes():
 #   정의해 교체하는 식으로 확장할 수 있다.
 # ──────────────────────────────────────────────────────────────────────────
 PALETTE = {
-    "text": "#000000",          # 제목(일반)
-    "text_dim": "#999999",      # 제목(종료/제외 흐림)
-    "text_meta": "#555555",     # 메타(진행률 등)
-    "card_handle": "#999999",   # 업무 드래그 핸들
-    "item_handle": "#bbbbbb",   # 항목 드래그 핸들
-    "kind_fallback": "#666666",
-    "empty_hint": "#999999",
+    "text": "#202124",          # 제목(일반)
+    "text_dim": "#9aa0a6",      # 제목(종료/제외 흐림)
+    "text_meta": "#80868b",     # 메타(유형·진행률) — 약하게
+    "card_handle": "#bdc1c6",   # 업무 드래그 핸들
+    "item_handle": "#cfd3d7",   # 항목 드래그 핸들
+    "kind_fallback": "#80868b",
+    "empty_hint": "#9aa0a6",
     "group_header": "#3a6ea5",
-    "rank_dimmed": "#9aa0a6",
+    "rank_dimmed": "#bdc1c6",
+    "chevron": "#9aa0a6",       # 접기/펼치기 셰브론
+    "bar_track": "#e6e8eb",     # 미니 진행바 트랙
+    "bar_fill": "#5b9bd5",      # 미니 진행바 진행
+    "bar_done": "#34a853",      # 미니 진행바 100%
 }
 # 우선순위 배지 색 — 1 빨강 / 2 주황 / 3 노랑
 RANK_COLORS = {1: "#d9342b", 2: "#e8821e", 3: "#caa200"}
+# 상태 칩 색 (연한 배경, 진한 글자) — 진하게 채워 충돌하던 배지를 차분하게.
+STATUS_CHIP = {
+    "진행": ("#e7f0fb", "#1f5fa8"),
+    "완료": ("#e6f4ec", "#1f7a44"),
+    "중단": ("#fbe9e9", "#b23a3a"),
+    "종료": ("#eef0f2", "#5f6368"),
+    "제외": ("#f1f1f1", "#9aa0a6"),
+}
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -211,9 +223,11 @@ class TaskCard:
         self.task = task
         self.position = 0
         self.frame = None          # 카드 바깥 프레임 (app.body 에 pack)
-        self.rank_lbl = None       # 순위 배지 (#N, 색)
+        self.rank_lbl = None       # 순위 점 (색으로 1/2/3 표시)
         self.title_lbl = None      # 제목 라벨
         self.prog_lbl = None       # 진행률 (n/m)
+        self.prog_bar = None       # 미니 진행바 (Canvas)
+        self.hover_group = None    # 마우스 올렸을 때만 보이는 컨트롤(수정·✎·🗑·↕)
         self.item_blocks = {}      # {item_id: block Frame} — 항목 드래그 정렬용
         # 편집 모드: 켜면 각 항목의 +세부·✕ 버튼이 보인다(평소엔 숨김 → 깔끔).
         # 카드 객체가 들고 있어 rebuild 후에도 유지된다(전체 render 때만 초기화).
@@ -229,8 +243,12 @@ class TaskCard:
     def build(self, position):
         """카드 바깥 프레임을 만들어 body 에 붙이고 내용을 채운다."""
         self.frame = ttk.Frame(self.app.body, relief="solid",
-                               borderwidth=1, padding=6)
-        self.frame.pack(fill="x", pady=(0, 8))
+                               borderwidth=1, padding=10)
+        self.frame.pack(fill="x", pady=(0, 10))
+        # hover 컨트롤: 마우스가 카드 위에 있을 때만 수정/삭제/드래그 버튼을 보인다.
+        # 프레임은 rebuild 후에도 유지되므로 바인딩은 여기서 한 번만 건다.
+        self.frame.bind("<Enter>", lambda e: self._show_hover(True))
+        self.frame.bind("<Leave>", self._on_hover_leave)
         self._populate(position)
         return self.frame
 
@@ -266,94 +284,109 @@ class TaskCard:
         self._headers_shown = False
         self._last_title_fit = None   # 새 제목 라벨이므로 캐시 초기화
 
-        header = ttk.Frame(self.frame)
-        header.pack(fill="x")
-
-        # 업무 드래그 핸들 (카드 순서 정렬 — 우선순위 배지와는 별개)
-        handle = ttk.Label(header, text="↕", cursor="fleur", foreground="#999")
-        handle.pack(side="left", padx=(0, 2))
-        handle.bind("<ButtonPress-1>", lambda e: app._drag_start(task))
-        handle.bind("<B1-Motion>", app._drag_motion)
-        handle.bind("<ButtonRelease-1>", app._drag_end)
-
-        arrow = "▶" if task.get("collapsed") else "▼"
-        ttk.Button(header, text=arrow, width=2,
-                   command=lambda: app.toggle_collapse(task)).pack(side="left")
-
         dimmed = task.get("status") in STATUS_DIMMED
         # '제외'면 잠금: 상태 변경과 드래그만 허용하고 내부 편집은 전부 막는다.
         locked = task.get("status") == "제외"
         if locked:
             self.edit_mode = False   # 잠긴 카드는 편집 모드 자체가 꺼져 있어야 한다.
-        # 우선순위 배지(1/2/3) — 클릭하면 메뉴로 변경(상태 버튼과 동일한 방식).
-        # 드래그 순서와는 독립.
         priority = self._priority()
-        self.rank_lbl = tk.Menubutton(header, text=str(priority),
-                                      bg=self._rank_color(priority, dimmed), fg="white",
-                                      font=app.card_font(-1, bold=True), padx=6,
-                                      relief="raised", cursor="hand2", takefocus=0)
+        blend = self._blend_bg()     # 점·셰브론을 카드 배경에 자연스럽게 녹임
+
+        # ── 1줄: 셰브론 · 순위 점 · 제목 · (hover 컨트롤) · 상태 칩 ──
+        row1 = ttk.Frame(self.frame)
+        row1.pack(fill="x")
+
+        arrow = "▶" if task.get("collapsed") else "▼"
+        chev = tk.Label(row1, text=arrow, fg=PALETTE["chevron"], bg=blend,
+                        cursor="hand2", font=app.card_font(-1), takefocus=0)
+        chev.pack(side="left", padx=(0, 4))
+        chev.bind("<Button-1>", lambda e: app.toggle_collapse(task))
+
+        # 우선순위 점(색=1/2/3). 클릭하면 메뉴로 변경. 드래그 순서와는 독립.
+        rc = self._rank_color(priority, dimmed)
+        self.rank_lbl = tk.Menubutton(
+            row1, text="●", fg=rc, bg=blend, activebackground=blend,
+            activeforeground=rc, font=app.card_font(2, bold=True), bd=0,
+            relief="flat", padx=0, pady=0, highlightthickness=0,
+            cursor="hand2", takefocus=0)
         pmenu = tk.Menu(self.rank_lbl, tearoff=0)
         for v in (1, 2, 3):
             pmenu.add_command(label="우선순위 {}".format(v),
                               foreground=self._rank_color(v, False),
                               command=lambda val=v: self.set_priority(val))
         self.rank_lbl["menu"] = pmenu
-        self.rank_lbl.pack(side="left", padx=(6, 4))
+        self.rank_lbl.pack(side="left", padx=(0, 6))
 
-        # 제목 라벨은 생성만 해두고 '맨 마지막에' pack 한다. 그래야 폭이 좁아질 때
-        # 고정 버튼들이 먼저 자리를 차지하고, 남는 가운데 공간만 제목이 차지한다
-        # (= 제목이 잘릴지언정 버튼은 절대 가려지지 않음). 길면 '…'로 줄인다.
-        self.title_lbl = ttk.Label(header, text=task.get("title") or "(제목 없음)",
-                                   font=app.title_font, cursor="hand2", anchor="w",
-                                   foreground=("#999" if dimmed else "#000"))
-        # 제목 더블클릭 → 이름 바로 수정 (잠금 시 비활성)
+        # 제목 — 맨 마지막에 pack(남는 가운데를 차지, 길면 '…'). 더블클릭=이름 수정.
+        self.title_lbl = ttk.Label(
+            row1, text=task.get("title") or "(제목 없음)", font=app.title_font,
+            cursor="hand2", anchor="w",
+            foreground=(PALETTE["text_dim"] if dimmed else PALETTE["text"]))
         if not locked:
-            self.title_lbl.bind(
-                "<Double-Button-1>",
-                lambda e: app.rename_task(task, self.title_lbl))
+            self.title_lbl.bind("<Double-Button-1>",
+                                lambda e: app.rename_task(task, self.title_lbl))
 
-        # 오른쪽: 삭제 / 수정 / 상태 / 진행률 / 유형 (오른쪽 끝부터 차례로)
-        ttk.Button(header, text="🗑", width=3,
-                   command=lambda: app.delete_task(task)).pack(side="right")
-        ttk.Button(header, text="✎", width=3,
-                   state=("disabled" if locked else "normal"),
-                   command=lambda: app.edit_task(task)).pack(side="right", padx=(0, 4))
-        # 수정 토글: 켜면 각 항목의 +세부·✕ 버튼이 보인다(Toolbutton = 눌린 모양).
-        self.edit_var = tk.BooleanVar(value=self.edit_mode)
-        ttk.Checkbutton(header, text="수정", style="Toolbutton",
-                        variable=self.edit_var, takefocus=0,
-                        state=("disabled" if locked else "normal"),
-                        command=self._toggle_edit).pack(side="right", padx=(0, 4))
+        # 상태 칩 — 오른쪽 끝에 고정(가장 먼저 right pack → hover 컨트롤이 떠도 안 밀림).
         status = task.get("status", "진행")
-        smb = tk.Menubutton(header, text=status,
-                            bg=STATUS_COLORS.get(status, "#666"),
-                            fg="white", font=app.card_font(-2, bold=True),
-                            relief="raised", padx=6, takefocus=0)
+        chip_bg, chip_fg = self._status_chip_colors(status)
+        smb = tk.Menubutton(
+            row1, text=" {} ▾".format(status), bg=chip_bg, fg=chip_fg,
+            activebackground=chip_bg, activeforeground=chip_fg,
+            font=app.card_font(-1, bold=True), relief="flat", bd=0,
+            padx=8, pady=1, highlightthickness=0, cursor="hand2", takefocus=0)
         smenu = tk.Menu(smb, tearoff=0)
         for s in STATUS_ORDER:
             smenu.add_command(label=s, foreground=STATUS_COLORS.get(s, "#000"),
                               command=lambda val=s: app.set_status(task, val))
         smb["menu"] = smenu
-        smb.pack(side="right", padx=(0, 6))
-        done, total = task_progress(task)
-        self.prog_lbl = ttk.Label(header, text="{}/{}".format(done, total),
-                                  foreground="#555")
-        self.prog_lbl.pack(side="right", padx=(0, 8))
-        if task.get("kind"):
-            ttk.Label(header, text=task["kind"],
-                      foreground=KIND_COLORS.get(task["kind"], "#666"),
-                      font=app.card_font(-2)).pack(side="right", padx=(6, 0))
+        smb.pack(side="right")
 
-        # 남는 가운데 공간을 제목이 차지(잘리면 '…'). Configure 마다 다시 맞춘다.
+        # hover 컨트롤(수정 토글·✎·🗑·↕) — 평소 숨김, 마우스 올리면 상태 칩 왼쪽에 등장.
+        self.hover_group = ttk.Frame(row1)
+        hg = self.hover_group
+        dh = ttk.Label(hg, text="↕", cursor="fleur", foreground=PALETTE["card_handle"])
+        dh.pack(side="left", padx=(0, 6))
+        dh.bind("<ButtonPress-1>", lambda e: app._drag_start(task))
+        dh.bind("<B1-Motion>", app._drag_motion)
+        dh.bind("<ButtonRelease-1>", app._drag_end)
+        self.edit_var = tk.BooleanVar(value=self.edit_mode)
+        ttk.Checkbutton(hg, text="수정", style="Toolbutton", variable=self.edit_var,
+                        takefocus=0, state=("disabled" if locked else "normal"),
+                        command=self._toggle_edit).pack(side="left", padx=(0, 4))
+        ttk.Button(hg, text="✎", width=3, state=("disabled" if locked else "normal"),
+                   command=lambda: app.edit_task(task)).pack(side="left", padx=(0, 4))
+        ttk.Button(hg, text="🗑", width=3,
+                   command=lambda: app.delete_task(task)).pack(side="left")
+
         self.title_lbl.pack(side="left", fill="x", expand=True)
         self.title_lbl.bind("<Configure>", self._refit_title)
+
+        # ── 2줄: 유형 · 진행률(n/m) + 미니 진행바 ──
+        row2 = ttk.Frame(self.frame)
+        row2.pack(fill="x", pady=(3, 0))
+        if task.get("kind"):
+            ttk.Label(row2, text=task["kind"],
+                      foreground=KIND_COLORS.get(task["kind"], PALETTE["kind_fallback"]),
+                      font=app.card_font(-1)).pack(side="left", padx=(0, 8))
+        done, total = task_progress(task)
+        self.prog_lbl = ttk.Label(row2, text="{}/{}".format(done, total),
+                                  foreground=PALETTE["text_meta"], font=app.card_font(-1))
+        self.prog_lbl.pack(side="left")
+        self.prog_bar = tk.Canvas(row2, height=6, bg=blend, bd=0,
+                                  highlightthickness=0, cursor="arrow")
+        self.prog_bar.pack(side="left", fill="x", expand=True, padx=(8, 2), pady=(1, 1))
+        self.prog_bar.bind("<Configure>", lambda e: self._draw_progress())
+        app.root.after_idle(self._draw_progress)     # 폭이 잡힌 뒤 최초 1회 그리기
+
+        # 편집 모드거나 이미 마우스가 카드 위에 있으면 hover 컨트롤을 곧장 보인다.
+        app.root.after_idle(self._sync_hover_to_pointer)
 
         if task.get("collapsed"):
             return
 
         # 본문 컨트롤: 항목 추가 + 프리셋 불러오기
         controls = ttk.Frame(self.frame)
-        controls.pack(fill="x", pady=(6, 2))
+        controls.pack(fill="x", pady=(10, 2))
         ttk.Button(controls, text="+ 항목",
                    state=("disabled" if locked else "normal"),
                    command=self.begin_add_item).pack(side="left")
@@ -362,7 +395,7 @@ class TaskCard:
         items = task.setdefault("items", [])
         if not items:
             ttk.Label(self.frame, text="항목 없음 — [+ 항목] 또는 [프리셋 불러오기]",
-                      foreground="#999").pack(anchor="w", padx=(4, 0), pady=(2, 0))
+                      foreground=PALETTE["empty_hint"]).pack(anchor="w", padx=(4, 0), pady=(2, 0))
             self._maybe_start_inline_edit()
             return
 
@@ -391,7 +424,7 @@ class TaskCard:
         for g in present:
             if multi:
                 label = "[{}]".format(g) if g else "[직접 작성]"
-                ttk.Label(self.frame, text=label, foreground="#3a6ea5",
+                ttk.Label(self.frame, text=label, foreground=PALETTE["group_header"],
                           font=self.app.card_font(-1, bold=True)).pack(anchor="w", pady=(6, 1))
             for item in [it for it in items if it.get("group", "") == g]:
                 self._render_item_block(item, locked)
@@ -710,19 +743,100 @@ class TaskCard:
         if self.prog_lbl is not None and self.prog_lbl.winfo_exists():
             done, total = task_progress(self.task)
             self.prog_lbl.config(text="{}/{}".format(done, total))
+        self._draw_progress()   # 미니 진행바도 함께 갱신
 
     def set_priority(self, value):
-        """우선순위 변경 → 배지 글자·색만 갱신(재생성 없음). 드래그 순서엔 영향 없음."""
+        """우선순위 변경 → 점 색만 갱신(재생성 없음). 드래그 순서엔 영향 없음."""
         self.task["priority"] = value
         self.app.save()
         if self.rank_lbl is not None and self.rank_lbl.winfo_exists():
             dimmed = self.task.get("status") in STATUS_DIMMED
-            self.rank_lbl.config(text=str(value), bg=self._rank_color(value, dimmed))
+            col = self._rank_color(value, dimmed)
+            self.rank_lbl.config(fg=col, activeforeground=col)
 
     def set_drag_highlight(self, on):
         """드래그 중 강조 — 테두리 두께는 그대로 두고 relief 만 바꿔 밀림 방지."""
         if self.frame is not None and self.frame.winfo_exists():
             self.frame.configure(relief="raised" if on else "solid")
+
+    # ---- 외형 보조 (색 블렌드 · 상태 칩 · 미니 진행바) -------------------
+    @staticmethod
+    def _blend_bg():
+        """카드(ttk.Frame) 배경색 — 점·셰브론 tk 위젯을 자연스럽게 녹이기 위함."""
+        try:
+            bg = ttk.Style().lookup("TFrame", "background")
+        except Exception:  # noqa: BLE001
+            bg = ""
+        return bg or "SystemButtonFace"
+
+    @staticmethod
+    def _status_chip_colors(status):
+        """상태 칩의 (배경, 글자) 색."""
+        return STATUS_CHIP.get(status, ("#eceff1", "#5f6368"))
+
+    def _draw_progress(self):
+        """미니 진행바(Canvas)를 현재 진행률로 다시 그린다(트랙 + 진행분)."""
+        c = self.prog_bar
+        if c is None or not c.winfo_exists():
+            return
+        w = c.winfo_width()
+        h = int(c.cget("height"))
+        c.delete("all")
+        if w <= 1:        # 아직 폭 미정 — <Configure> 가 다시 부른다.
+            return
+        done, total = task_progress(self.task)
+        pct = (done / total) if total else 0.0
+        c.create_rectangle(0, 0, w, h, fill=PALETTE["bar_track"], outline="")
+        fw = int(round(w * max(0.0, min(1.0, pct))))
+        if fw > 0:
+            color = PALETTE["bar_done"] if pct >= 1.0 else PALETTE["bar_fill"]
+            c.create_rectangle(0, 0, fw, h, fill=color, outline="")
+
+    # ---- hover 컨트롤 표시/숨김 ------------------------------------------
+    def _within_card(self, w):
+        """위젯 w 가 이 카드(frame) 안에 속하는지(자식 포함) 검사."""
+        while w is not None:
+            if w is self.frame:
+                return True
+            w = getattr(w, "master", None)
+        return False
+
+    def _show_hover(self, show):
+        """hover 컨트롤 그룹을 보이거나 숨긴다. 편집 모드면 항상 보인다."""
+        hg = self.hover_group
+        if hg is None or not hg.winfo_exists():
+            return
+        if self.edit_mode:
+            show = True
+        mapped = bool(hg.winfo_ismapped())
+        if show and not mapped:
+            # 상태 칩보다 나중에 right-pack → 칩 왼쪽에 자리(칩은 그대로 고정).
+            hg.pack(side="right", padx=(8, 8))
+        elif not show and mapped:
+            hg.pack_forget()
+
+    def _on_hover_leave(self, event=None):
+        """카드를 벗어났을 때만 숨긴다(자식 위젯으로 이동한 경우는 무시)."""
+        if self.frame is None or not self.frame.winfo_exists():
+            return
+        try:
+            x, y = self.frame.winfo_pointerxy()
+            w = self.frame.winfo_containing(x, y)
+        except Exception:  # noqa: BLE001
+            w = None
+        if not self._within_card(w):
+            self._show_hover(False)
+
+    def _sync_hover_to_pointer(self):
+        """rebuild 직후 등 — 지금 마우스가 카드 위라면 hover 컨트롤을 곧장 표시."""
+        if self.frame is None or not self.frame.winfo_exists():
+            return
+        try:
+            x, y = self.frame.winfo_pointerxy()
+            w = self.frame.winfo_containing(x, y)
+        except Exception:  # noqa: BLE001
+            w = None
+        self._show_hover(self._within_card(w))
 
 
 # ──────────────────────────────────────────────────────────────────────────
