@@ -58,6 +58,26 @@ def available_themes():
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# UI 색상 토큰 (UI 전용 — 도메인 색 KIND_COLORS/STATUS_COLORS 는 core 에 있다)
+#   화면에 쓰는 색을 한곳에 모아 둔다. 추후 다크 모드는 이 팔레트를 한 벌 더
+#   정의해 교체하는 식으로 확장할 수 있다.
+# ──────────────────────────────────────────────────────────────────────────
+PALETTE = {
+    "text": "#000000",          # 제목(일반)
+    "text_dim": "#999999",      # 제목(종료/제외 흐림)
+    "text_meta": "#555555",     # 메타(진행률 등)
+    "card_handle": "#999999",   # 업무 드래그 핸들
+    "item_handle": "#bbbbbb",   # 항목 드래그 핸들
+    "kind_fallback": "#666666",
+    "empty_hint": "#999999",
+    "group_header": "#3a6ea5",
+    "rank_dimmed": "#9aa0a6",
+}
+# 우선순위 배지 색 — 1 빨강 / 2 주황 / 3 노랑
+RANK_COLORS = {1: "#d9342b", 2: "#e8821e", 3: "#caa200"}
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # 3. 업무 추가/수정 다이얼로그 (제목 + 유형 + 카테고리)
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -231,8 +251,8 @@ class TaskCard:
     def _rank_color(priority, dimmed):
         # 우선순위 1 빨강 / 2 주황 / 3 노랑. 종료·제외(dimmed)면 회색.
         if dimmed:
-            return "#9aa0a6"
-        return {1: "#d9342b", 2: "#e8821e", 3: "#caa200"}.get(priority, "#caa200")
+            return PALETTE["rank_dimmed"]
+        return RANK_COLORS.get(priority, RANK_COLORS[3])
 
     def _priority(self):
         p = self.task.get("priority", 3)
@@ -428,7 +448,7 @@ class TaskCard:
         row.pack(fill="x")
 
         # 항목 드래그 핸들 (업무 내부 정렬) — 잠금 상태에서도 드래그는 허용
-        ih = ttk.Label(row, text="↕", cursor="fleur", foreground="#bbb")
+        ih = ttk.Label(row, text="↕", cursor="fleur", foreground=PALETTE["item_handle"])
         ih.pack(side="left", padx=(2, 2))
         ih.bind("<ButtonPress-1>",
                 lambda e, it=item: app._item_drag_start(e, task, it))
@@ -1285,7 +1305,7 @@ class ChecklistApp:
             pass
 
     # ---- 드래그 고스트 (커서를 따라다니는 떠 있는 라벨) -------------------
-    def _make_ghost(self, text, color="#d9342b"):
+    def _make_ghost(self, text, color=RANK_COLORS[1]):
         g = tk.Toplevel(self.root)
         g.overrideredirect(True)
         try:
@@ -1365,9 +1385,9 @@ class ChecklistApp:
         handle = event.widget
         self._item_drag = {"task": task, "id": item["id"], "handle": handle,
                            "ghost": self._make_ghost("↕  " + item.get("text", ""),
-                                                     color="#3a6ea5")}
+                                                     color=PALETTE["group_header"])}
         try:
-            handle.configure(foreground="#d9342b")
+            handle.configure(foreground=RANK_COLORS[1])
         except Exception:  # noqa: BLE001
             pass
 
@@ -1409,7 +1429,7 @@ class ChecklistApp:
         handle = self._item_drag.get("handle")
         if handle is not None:
             try:
-                handle.configure(foreground="#bbb")
+                handle.configure(foreground=PALETTE["item_handle"])
             except Exception:  # noqa: BLE001
                 pass
         task = self._item_drag["task"]
